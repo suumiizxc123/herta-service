@@ -68,12 +68,17 @@ export default function App() {
   const [inboxSelection, setInboxSelection] = useState(() => new Set());
   const [receiver, setReceiver] = useState({ running: false, port: '8006', token: '' });
   const [integrationMessage, setIntegrationMessage] = useState('');
-  const [backupSettings, setBackupSettings] = useState({ enabled: false, directory: '', cron: '0 2 * * *' });
+  const [backupSettings, setBackupSettings] = useState({ enabled: false, directory: '', cron: '0 2 * * *', retentionCount: 30 });
   const [backupSettingsSaving, setBackupSettingsSaving] = useState(false);
   const [backupFrequency, setBackupFrequency] = useState('daily');
   const [backupAdvanced, setBackupAdvanced] = useState(false);
   const [backupNextRun, setBackupNextRun] = useState('');
   const [backupScheduleError, setBackupScheduleError] = useState('');
+  const [platform, setPlatform] = useState({ engine: { available: false }, services: [], worker: null });
+  const [platformLoading, setPlatformLoading] = useState(false);
+  const [platformError, setPlatformError] = useState('');
+  const [platformOptions, setPlatformOptions] = useState({ localKafka: false, search: false });
+  const [platformLogText, setPlatformLogText] = useState('');
 
   const invoke = useCallback(async (method, ...args) => {
     try { return await window.herta[method](...args); }
@@ -286,11 +291,42 @@ export default function App() {
     catch (error) { setIntegrationMessage(error.message); }
   }, [invoke]);
 
+  const refreshPlatform = useCallback(async () => {
+    try {
+      const next = await invoke('platformStatus'); setPlatform(next); setPlatformError('');
+      if (next.worker?.ok) {
+        setKafkaListening(Boolean(next.worker.kafka?.listening));
+        setReceiver((current) => ({ ...current, ...(next.worker.receiver || {}) }));
+        setSourceInbox(next.worker.inbox || []);
+      }
+    }
+    catch (error) { setPlatformError(error.message); }
+  }, [invoke]);
+
+  const startPlatform = async () => {
+    setPlatformLoading(true); setPlatformError('');
+    try {
+      setPlatform(await invoke('startPlatform', platformOptions));
+      if (platformOptions.localKafka) setKafkaSource((current) => ({ ...current, brokers: 'localhost:19092' }));
+      notify('Docker workers started.');
+    }
+    catch (error) { setPlatformError(error.message); }
+    finally { setPlatformLoading(false); }
+  };
+
+  const stopPlatform = async () => {
+    setPlatformLoading(true); setPlatformError('');
+    try { setPlatform(await invoke('stopPlatform')); notify('Docker workers stopped.'); }
+    catch (error) { setPlatformError(error.message); }
+    finally { setPlatformLoading(false); }
+  };
+
   useEffect(() => {
     if (view === 'health' || view === 'overview') refreshHealth();
     if (view === 'activity' || view === 'backups' || view === 'overview') refreshAudit();
     if (view === 'integrations' || view === 'overview') refreshInbox();
-  }, [view, refreshHealth, refreshAudit, refreshInbox]);
+    if (view === 'overview') refreshPlatform();
+  }, [view, refreshHealth, refreshAudit, refreshInbox, refreshPlatform]);
 
   useEffect(() => {
     if (view !== 'integrations') return undefined;
@@ -301,10 +337,10 @@ export default function App() {
   useEffect(() => {
     if (view !== 'overview') return undefined;
     const timer = window.setInterval(() => {
-      refreshHealth(); refreshAudit(); refreshInbox();
-    }, 30000);
+      refreshHealth(); refreshAudit(); refreshInbox(); refreshPlatform();
+    }, 20000);
     return () => window.clearInterval(timer);
-  }, [view, refreshHealth, refreshAudit, refreshInbox]);
+  }, [view, refreshHealth, refreshAudit, refreshInbox, refreshPlatform]);
 
   const fetchRest = async () => {
     setLoading(true); setIntegrationMessage('');
@@ -396,7 +432,7 @@ export default function App() {
           <p className="mt-2 truncate text-[11px] text-slate-500" title={session.baseUrl}>{session.baseUrl}</p>
         </div>
         <Button variant="ghost" className="mt-3 w-full justify-start text-slate-600 hover:bg-slate-100 hover:text-slate-900" onClick={signOut}><LogOut /> Sign out</Button>
-        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.7.0'}</div>
+        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.8.0'}</div>
       </div>
     </aside>
 
@@ -414,8 +450,13 @@ export default function App() {
             <DashboardMetric icon={HeartPulse} label="HERTA API" value={health?.ok ? `${health.latencyMs} ms` : healthError ? 'Unavailable' : 'Checking…'} detail={health?.ok ? 'Latest response time' : healthError ? 'Check connection settings' : 'Running health check'} tone={health?.ok ? 'green' : healthError ? 'red' : 'amber'} />
             <DashboardMetric icon={Users} label="Subjects" value={(health?.subjectCount ?? serverCount).toLocaleString()} detail="Records visible in HERTA" tone="blue" />
             <DashboardMetric icon={FileArchive} label="Intake inbox" value={dashboardStats.waitingInbox.toLocaleString()} detail={dashboardStats.failedInbox ? `${dashboardStats.failedInbox} item(s) need attention` : 'REST / Kafka files waiting'} tone={dashboardStats.failedInbox ? 'amber' : 'violet'} />
-            <DashboardMetric icon={ArchiveRestore} label="Automatic backup" value={backupSettings.enabled && backupSettings.directory ? 'Scheduled' : 'Not active'} detail={backupSettings.enabled && backupSettings.directory ? frequencyLabel[backupFrequency] || frequencyLabel.custom : 'Choose destination and enable'} tone={backupSettings.enabled && backupSettings.directory ? 'green' : 'slate'} />
+            <DashboardMetric icon={ArchiveRestore} label="Automatic backup" value={backupSettings.enabled && backupSettings.directory ? (platform.worker?.ok && platform.worker.authenticated ? 'Scheduled' : 'Paused') : 'Not active'} detail={backupSettings.enabled && backupSettings.directory ? (platform.worker?.authenticated ? (frequencyLabel[backupFrequency] || frequencyLabel.custom) : 'Start workers and sign in to HERTA') : 'Choose destination and enable'} tone={backupSettings.enabled && backupSettings.directory && platform.worker?.authenticated ? 'green' : 'slate'} />
           </div>
+
+          <Card className="mt-5 overflow-hidden border-slate-200/80 shadow-sm"><CardHeader className="flex-row flex-wrap items-center justify-between gap-3 border-b bg-white px-5 py-4"><div><CardTitle className="text-base">Docker background workers</CardTitle><CardDescription className="mt-1">Start the HERTA worker independently from this window; Docker keeps it running in the background.</CardDescription></div><div className="flex items-center gap-2"><Badge variant="outline" className={platform.engine?.available ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-800'}>{platform.engine?.available ? `Docker ${platform.engine.version || 'ready'}` : 'Docker unavailable'}</Badge><Button size="sm" onClick={startPlatform} disabled={platformLoading}>{platformLoading ? <LoaderCircle className="animate-spin" /> : <Play />}{platform.worker?.ok ? 'Apply / start' : 'Start workers'}</Button><Button variant="outline" size="sm" onClick={stopPlatform} disabled={platformLoading || !platform.services?.length}><Pause /> Stop</Button></div></CardHeader><CardContent className="grid gap-4 p-5 xl:grid-cols-[1fr_auto]">
+            <div className="space-y-3"><div className="flex flex-wrap items-center gap-2 text-xs"><span className={`size-2 rounded-full ${platform.worker?.ok ? 'bg-emerald-500' : 'bg-slate-300'}`} /><span className="font-medium text-slate-800">HERTA integration & backup worker</span><Badge variant="secondary" className={platform.worker?.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}>{platform.worker?.ok ? 'Running' : 'Stopped'}</Badge>{platform.worker?.authenticated && <Badge variant="outline" className="text-emerald-700">HERTA session synced</Badge>}</div><div className="grid gap-2 sm:grid-cols-2">{(platform.services || []).map((service) => <div key={service.ID || service.Name || service.Service} className="flex items-center justify-between rounded-lg border px-3 py-2 text-[11px]"><span className="font-medium text-slate-700">{service.Service}</span><span className="text-slate-500">{service.Health || service.State || service.Status}</span></div>)}{!platform.services?.length && <div className="rounded-lg border border-dashed px-3 py-2 text-[11px] text-slate-500 sm:col-span-2">{platform.engine?.available ? 'No Docker workers are running yet.' : (platform.engine?.error || platformError || 'Install Docker Desktop and start its engine to run background workers.')}</div>}</div>{platformError && <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-800">{platformError}</div>}{platform.worker?.error && <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">{platform.worker.error}</div>}{platformLogText && <pre className="max-h-32 overflow-auto rounded-lg bg-slate-950 p-3 text-[10px] leading-4 text-slate-100">{platformLogText}</pre>}</div>
+            <div className="flex min-w-[220px] flex-col justify-center gap-3 rounded-xl border bg-slate-50/70 p-4"><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Optional local services</div><label className="flex items-center gap-2 text-xs text-slate-700"><Checkbox checked={platformOptions.localKafka} onCheckedChange={(checked) => setPlatformOptions((current) => ({ ...current, localKafka: Boolean(checked) }))} />Start a local Kafka broker</label><label className="flex items-center gap-2 text-xs text-slate-700"><Checkbox checked={platformOptions.search} onCheckedChange={(checked) => setPlatformOptions((current) => ({ ...current, search: Boolean(checked) }))} />Start Elasticsearch</label><div className="flex gap-2"><Button variant="outline" size="sm" className="flex-1" onClick={refreshPlatform}><RefreshCw /> Status</Button><Button variant="ghost" size="sm" onClick={async () => { try { setPlatformLogText(await invoke('platformLogs', 'herta-worker')); } catch (error) { setPlatformError(error.message); } }}>Logs</Button></div><div className="text-[10px] leading-4 text-slate-500">Worker data and scheduled ZIP snapshots persist in Docker volumes / the selected backup folder.</div></div>
+          </CardContent></Card>
 
           <div className="mt-5 grid gap-5 xl:grid-cols-[1.45fr_.85fr]">
             <Card className="overflow-hidden border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><div className="flex items-center justify-between gap-3"><div><CardTitle className="text-base">Data intake pipeline</CardTitle><CardDescription className="mt-1">Current desktop path from source to HERTA.</CardDescription></div><Badge variant="secondary" className="bg-blue-50 text-blue-700">NIST workflow</Badge></div></CardHeader><CardContent className="p-5">
@@ -502,13 +543,14 @@ export default function App() {
                   <div><div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">1 · Backup folder</div><div className="flex items-center gap-2 rounded-xl border bg-slate-50/70 p-2"><div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-white text-slate-500"><FolderOpen className="size-4" /></div><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-800">{backupSettings.directory || 'No folder selected'}</div><div className="mt-0.5 text-[10px] text-slate-500">Timestamped ZIP snapshots are saved here</div></div><Button variant="outline" size="sm" onClick={chooseBackupDestination}>Choose folder</Button></div></div>
                   <div><div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">2 · Backup frequency</div><div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{[['every15', '15 min', 'For testing'], ['hourly', 'Hourly', 'At :00'], ['daily', 'Daily', 'At 02:00'], ['weekly', 'Weekly', 'Mon at 02:00']].map(([key, title, note]) => <button key={key} onClick={() => { setBackupFrequency(key); setBackupSettings((current) => ({ ...current, cron: cronForFrequency[key] })); }} className={`rounded-xl border p-3 text-left transition-colors ${backupFrequency === key ? 'border-[#315a80] bg-[#f1f6fa] ring-1 ring-[#315a80]/15' : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'}`}><div className={`text-sm font-semibold ${backupFrequency === key ? 'text-[#244d72]' : 'text-slate-800'}`}>{title}</div><div className="mt-1 text-[10px] text-slate-500">{note}</div></button>)}</div><button onClick={() => { setBackupFrequency('custom'); setBackupAdvanced(true); }} className={`mt-2 text-xs font-medium ${backupFrequency === 'custom' ? 'text-[#315a80]' : 'text-slate-500 hover:text-slate-800'}`}>{backupAdvanced ? 'Advanced schedule selected' : 'Advanced: enter a cron schedule'}</button></div>
                   {backupAdvanced && <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4"><label htmlFor="backup-cron" className="mb-1.5 block text-xs font-medium">Cron expression</label><Input id="backup-cron" value={backupSettings.cron} onChange={(event) => { setBackupFrequency('custom'); setBackupSettings((current) => ({ ...current, cron: event.target.value })); }} placeholder="0 2 * * *" className="mono bg-white" /><p className="mt-2 text-[11px] text-slate-500">Minute · hour · day · month · weekday. Example <code className="mono rounded bg-white px-1">0 2 * * *</code> means daily at 02:00.</p></div>}
-                  <div className={`rounded-2xl border p-4 ${backupScheduleError ? 'border-amber-200 bg-amber-50' : 'border-[#dce7f0] bg-[#f5f8fb]'}`}><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-[10px] font-semibold uppercase tracking-[.12em] text-slate-500">Next scheduled run</div><div className="mt-1 text-base font-semibold text-slate-900">{backupScheduleError || (backupNextRun ? new Date(backupNextRun).toLocaleString() : 'Calculating…')}</div></div><div className="rounded-xl bg-white px-3 py-2 text-right shadow-sm"><div className="text-[10px] uppercase tracking-wide text-slate-400">Frequency</div><div className="mt-0.5 text-xs font-semibold text-slate-700">{frequencyLabel[backupFrequency] || frequencyLabel.custom}</div></div></div><div className="mt-3 border-t border-slate-200/80 pt-3 text-[11px] leading-5 text-slate-600">{backupScheduleError || (!backupSettings.enabled ? 'Preview only · enable and save below to start automatic backups.' : !backupSettings.directory ? 'Choose a destination folder to activate this schedule.' : 'Keep HERTA Operations open and signed in at this time.')}</div></div>
+                  <div className="rounded-xl border border-slate-200 p-4"><label htmlFor="backup-retention" className="block text-xs font-semibold text-slate-800">Keep recent snapshots</label><p className="mt-1 text-[11px] text-slate-500">Older HERTA ZIP snapshots are removed after a successful backup.</p><select id="backup-retention" value={backupSettings.retentionCount || 30} onChange={(event) => setBackupSettings((current) => ({ ...current, retentionCount: Number(event.target.value) }))} className="mt-3 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none focus:border-[#53799f] focus:ring-2 focus:ring-[#53799f]/15"><option value={7}>Keep 7 snapshots</option><option value={30}>Keep 30 snapshots</option><option value={90}>Keep 90 snapshots</option><option value={180}>Keep 180 snapshots</option></select><div className="mt-2 text-[10px] text-slate-500">Only timestamped HERTA snapshot ZIP files in this destination are considered.</div></div>
+                  <div className={`rounded-2xl border p-4 ${backupScheduleError ? 'border-amber-200 bg-amber-50' : 'border-[#dce7f0] bg-[#f5f8fb]'}`}><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-[10px] font-semibold uppercase tracking-[.12em] text-slate-500">Next scheduled run</div><div className="mt-1 text-base font-semibold text-slate-900">{backupScheduleError || (backupNextRun ? new Date(backupNextRun).toLocaleString() : 'Calculating…')}</div></div><div className="rounded-xl bg-white px-3 py-2 text-right shadow-sm"><div className="text-[10px] uppercase tracking-wide text-slate-400">Frequency</div><div className="mt-0.5 text-xs font-semibold text-slate-700">{frequencyLabel[backupFrequency] || frequencyLabel.custom}</div></div></div><div className="mt-3 border-t border-slate-200/80 pt-3 text-[11px] leading-5 text-slate-600">{backupScheduleError || (!backupSettings.enabled ? 'Preview only · enable and save below to start automatic backups.' : !backupSettings.directory ? 'Choose a destination folder to activate this schedule.' : 'Docker worker must be running and have an active HERTA session; closing this window will not stop it.')}</div></div>
                   <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4"><label className="flex cursor-pointer items-center gap-2.5 text-xs font-medium text-slate-700"><Checkbox checked={backupSettings.enabled} onCheckedChange={(checked) => setBackupSettings((current) => ({ ...current, enabled: Boolean(checked) }))} />Turn on automatic backup</label><Button onClick={saveBackupSchedule} disabled={backupSettingsSaving} className="min-w-[175px] bg-[#244d72] hover:bg-[#183b5d]">{backupSettingsSaving ? <LoaderCircle className="animate-spin" /> : <CheckCircle2 />} Save schedule</Button></div>
                 </CardContent>
               </Card>
               <div className="grid gap-4 md:grid-cols-2"><Card className="border-slate-200"><CardContent className="flex items-center gap-4 p-5"><div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-700"><ArrowDownToLine className="size-5" /></div><div className="min-w-0 flex-1"><div className="text-sm font-semibold">Create snapshot now</div><div className="mt-1 text-xs text-muted-foreground">Export {serverCount.toLocaleString()} HERTA subjects to ZIP.</div></div><Button size="sm" variant="outline" onClick={createSnapshot} disabled={loading || !serverCount}>{loading ? <LoaderCircle className="animate-spin" /> : 'Run now'}</Button></CardContent></Card><Card className="border-slate-200"><CardContent className="flex items-center gap-4 p-5"><div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-600"><ArchiveRestore className="size-5" /></div><div className="min-w-0 flex-1"><div className="text-sm font-semibold">Restore snapshot</div><div className="mt-1 text-xs text-muted-foreground">Choose a ZIP and review before import.</div></div><Button size="sm" variant="outline" onClick={restoreSnapshot} disabled={loading}>Choose ZIP</Button></CardContent></Card></div>
             </div>
-            <Card className="overflow-hidden border-slate-200 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-sm">Backup status</CardTitle><CardDescription className="mt-1">Current schedule and recent activity.</CardDescription></CardHeader><CardContent className="space-y-5 p-5"><div className={`rounded-2xl p-4 ${backupSettings.enabled && backupSettings.directory ? 'bg-emerald-50' : 'bg-slate-50'}`}><div className="flex items-center gap-2"><span className={`size-2 rounded-full ${backupSettings.enabled && backupSettings.directory ? 'bg-emerald-500' : 'bg-slate-400'}`} /><span className={`text-sm font-semibold ${backupSettings.enabled && backupSettings.directory ? 'text-emerald-800' : 'text-slate-700'}`}>{backupSettings.enabled && backupSettings.directory ? 'Automatic backup is on' : 'Automatic backup is off'}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{frequencyLabel[backupFrequency] || frequencyLabel.custom}{backupSettings.enabled && backupSettings.directory ? ' · app must remain open' : ''}</p></div><div><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Destination</div><p className="mt-1 break-all text-xs leading-5 text-slate-700">{backupSettings.directory || 'Choose a folder to enable scheduled backup.'}</p></div><div className="border-t pt-4"><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Last backup</div><p className="mt-1 text-xs font-medium text-slate-800">{lastSnapshot ? new Date(lastSnapshot.at).toLocaleString() : 'No backup yet'}</p>{lastSnapshot && <p className="mt-1 break-all text-[11px] leading-4 text-slate-500">{lastSnapshot.summary}</p>}</div><div className="flex items-start gap-2 border-t pt-4 text-[11px] leading-5 text-slate-500"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>ZIP files contain sensitive biometric data. Restrict access to the destination folder.</span></div></CardContent></Card>
+            <Card className="overflow-hidden border-slate-200 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-sm">Backup status</CardTitle><CardDescription className="mt-1">Current schedule and recent activity.</CardDescription></CardHeader><CardContent className="space-y-5 p-5"><div className={`rounded-2xl p-4 ${backupSettings.enabled && backupSettings.directory ? 'bg-emerald-50' : 'bg-slate-50'}`}><div className="flex items-center gap-2"><span className={`size-2 rounded-full ${backupSettings.enabled && backupSettings.directory ? 'bg-emerald-500' : 'bg-slate-400'}`} /><span className={`text-sm font-semibold ${backupSettings.enabled && backupSettings.directory ? 'text-emerald-800' : 'text-slate-700'}`}>{backupSettings.enabled && backupSettings.directory ? 'Automatic backup is on' : 'Automatic backup is off'}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{frequencyLabel[backupFrequency] || frequencyLabel.custom}{backupSettings.enabled && backupSettings.directory ? ' · Docker worker runs in background' : ''}</p></div><div><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Destination</div><p className="mt-1 break-all text-xs leading-5 text-slate-700">{backupSettings.directory || 'Choose a folder to enable scheduled backup.'}</p></div><div className="border-t pt-4"><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Last backup</div><p className="mt-1 text-xs font-medium text-slate-800">{lastSnapshot ? new Date(lastSnapshot.at).toLocaleString() : 'No backup yet'}</p>{lastSnapshot && <p className="mt-1 break-all text-[11px] leading-4 text-slate-500">{lastSnapshot.summary}</p>}</div><div className="flex items-start gap-2 border-t pt-4 text-[11px] leading-5 text-slate-500"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>ZIP files contain sensitive biometric data. Restrict access to the destination folder.</span></div></CardContent></Card>
           </div>
         </>}
 
@@ -554,7 +596,7 @@ function Login({ config, setConfig, notice, loading, onSubmit }) {
     <section className="hidden w-[48%] flex-col justify-between border-r border-slate-200 bg-[#f3f6f9] px-12 py-10 text-slate-800 lg:flex">
       <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><Fingerprint className="size-6" /></div><div><div className="font-semibold tracking-wide">HERTA</div><div className="text-[11px] text-slate-500">Operations desktop</div></div></div>
       <div className="max-w-[500px] pb-6"><div className="mb-6 flex size-12 items-center justify-center rounded-2xl border border-slate-200 bg-white"><Database className="size-6 text-[#53799f]" /></div><div className="text-[34px] font-semibold leading-[1.17] tracking-tight">Biometric operations, <span className="text-[#53799f]">thoughtfully connected.</span></div><p className="mt-5 max-w-[420px] text-sm leading-6 text-slate-600">A secure desktop workspace for HERTA subject records, NIST file operations, and profile metadata checks.</p><div className="mt-9 grid grid-cols-3 gap-3"><Feature icon={Users} label="Subjects" /><Feature icon={FileArchive} label="NIST files" /><Feature icon={ShieldCheck} label="Local session" /></div></div>
-      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.7.0'}</div>
+      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.8.0'}</div>
     </section>
     <section className="flex flex-1 items-center justify-center px-6 py-10">
       <div className="w-full max-w-[410px]">
@@ -602,4 +644,3 @@ function SubjectTable({ subjects, selected, onSelect, onOpenDetails, loading, em
 function ImportTable({ rows }) { return <Table><TableHeader><TableRow><TableHead>File</TableHead><TableHead>Code</TableHead><TableHead>Status</TableHead><TableHead>Size</TableHead><TableHead>Message</TableHead></TableRow></TableHeader><TableBody>{rows.map((row, index) => <TableRow key={`${row.File}-${index}`}><TableCell className="max-w-[200px] truncate font-medium">{row.File}</TableCell><TableCell className="mono">{row.Code}</TableCell><TableCell><Badge variant={['Failed', 'Rejected', 'HTTP_ERROR'].includes(row.Status) ? 'destructive' : row.Status === 'DryRun' ? 'outline' : 'secondary'}>{row.Status}</Badge></TableCell><TableCell>{formatSize(Number(row.Bytes) || 0)}</TableCell><TableCell className="max-w-[240px] text-xs text-muted-foreground">{row.Message}</TableCell></TableRow>)}</TableBody></Table>; }
 function EmptyRow({ cols, text }) { return <TableRow><TableCell colSpan={cols} className="h-28 text-center text-sm text-muted-foreground">{text}</TableCell></TableRow>; }
 function InlineError({ text }) { return <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800">{text}</div>; }
-

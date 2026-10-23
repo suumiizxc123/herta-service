@@ -1,41 +1,38 @@
-# HERTA Operations Desktop 1.7.0
+# HERTA Operations Desktop 1.9.2
 
-An Electron desktop application for the everyday HERTA BioCom workflows in the supplied PowerShell scripts. It runs locally on the operator's computer and connects to the existing HERTA API. It does not require a browser service, Python, Docker, or a separate user database.
+Electron is the control interface. A Docker Compose worker handles REST intake, Kafka consumption, the persistent review inbox, and scheduled NIST ZIP backups independently of the Electron window. Windows requires Docker Desktop with its engine running; install/start Docker Desktop before using **Start workers** on the Overview page.
 
-## Included workflows
+## Background platform
 
-- Sign in to HERTA and keep the access token in memory for the current app session.
-- Browse and search subjects, export selected `.nist` files (up to 256 MiB per package), and save a ZIP with a CSV report.
-- Choose `.nist` files through a native file picker, preview the selection, and explicitly confirm imports by typing `IMPORT`.
-- Inspect profile length and JSON/Base64-like indicators without showing profile contents.
-- Create and restore local NIST snapshot ZIPs with a manifest and export report.
-- Schedule automatic NIST snapshot ZIPs into a selected folder with a five-field cron expression. The desktop must remain open and signed in to HERTA at the scheduled time.
-- Preview JPEG/PNG images found in subject data or in the subject's exported NIST record.
+- The core `herta-worker` container uses `restart: unless-stopped`, persists inbox files in a Docker volume, and exposes its control API only on `127.0.0.1:18127`.
+- REST sources can push NIST payloads to `http://127.0.0.1:18127/api/v1/nist`; the desktop shows a temporary bearer token. Files stay in the persistent inbox until imported successfully or discarded.
+- Kafka messages are consumed by the worker with manual offset commits after the matching NIST inbox items are imported or discarded.
+- Scheduled backups run inside the worker, write ZIP snapshots to the chosen Windows folder, retry a failed run up to three times, and continue when the Electron window closes while Docker remains running. Choose a retention limit in Backup settings; after a successful run, older timestamped HERTA ZIP snapshots are pruned to that limit.
+- The Overview page can additionally start a local Kafka broker (`localhost:19092`) or a single-node Elasticsearch instance (`localhost:19200`). These are optional local services; the worker can also connect to an existing Kafka broker.
 
-Automatic backup cron example: `0 2 * * *` runs daily at 02:00 local time. Use `*/15 * * * *` for every 15 minutes while testing. Automatic backups run inside the desktop app, so they pause when the app is closed or signed out.
-- Check HERTA API responsiveness and review a local audit history of desktop operations.
-- Inspect subject metadata and reveal a subject's profile on demand.
-- Fetch NIST file envelopes from a configured REST JSON endpoint, receive authenticated NIST POSTs on a loopback-only REST listener, and connect to a Kafka topic to receive raw NIST bytes or JSON Base64 file envelopes.
-- Test Kafka broker connectivity and create topics on an existing cluster. Topic creation does not provision a Kafka broker.
+Electron stores the HERTA access token in an encrypted per-user session file using the operating system encryption provider, never the password. On app startup it verifies the saved token with HERTA and refreshes the worker session; a rejected token is cleared, and signing out clears both saved and worker sessions. If Docker restarts while Electron is closed, the worker can start again but must wait for Electron to reopen and restore the session before authenticated backups can run. Docker Desktop normally starts when a Windows user signs in, so this setup is not a headless Windows Server deployment.
 
-The app never saves the HERTA password or token to disk. It uses Electron's isolated renderer and a narrow preload API; HERTA requests and local file access run in the main process. Certificate verification is off by default for HERTA installations using a private or self-signed certificate. Turn on **Verify server certificate** at sign-in when the HERTA server has a publicly trusted certificate. Activity history is stored locally and excludes biometric contents, subject identifiers, credentials, and tokens.
+The Kafka broker and Elasticsearch are optional infrastructure. PostgreSQL metadata storage, Redis, MinIO/S3 archive, Debezium CDC, Prometheus/Grafana, and production failover are not included in this local desktop stack. Elasticsearch is a local single-node development service with security disabled and its port bound to loopback; do not expose it to a network.
 
-Kafka, Debezium, databases, Redis, Elasticsearch, object storage, Prometheus/Grafana, and Keycloak are server-side infrastructure. The desktop app reports that boundary; it does not install or pretend to manage those services without corresponding HERTA management APIs.
+## Desktop workflows
 
-REST source responses use `{ "files": [{ "code": "SUB001", "fileContent": "BASE64_NIST" }] }` (or a single file object). The local receiver listens only on `127.0.0.1`, uses a random in-memory bearer token, and accepts `POST /api/v1/nist`. Kafka SASL credentials and REST tokens stay in memory. Incoming data is held in the desktop inbox until an operator previews and confirms the NIST import. Kafka offsets are committed only after successful imports; invalid records remain pending until explicitly discarded.
+- Browse/search/group HERTA subjects, inspect records and images, export NIST files, and review profile metadata.
+- Select NIST files, preview the batch, and explicitly confirm imports by typing `IMPORT`.
+- Fetch NIST envelopes from REST, receive authenticated REST posts, and consume Kafka raw NIST or JSON/Base64 envelopes into the worker inbox.
+- Create and restore local NIST snapshots. A snapshot exports HERTA subject records; it is not a physical database backup or failover replica.
+- Schedule ZIP snapshots with a five-field cron expression. `0 2 * * *` runs daily at 02:00 local time; `*/15 * * * *` is useful for testing.
 
 ## Run from source
 
-Install Node.js 22 or newer and pnpm 11, then run:
+Install Node.js 22 or newer, pnpm 11, and Docker Desktop. Then run:
 
 ```powershell
 pnpm install
 pnpm dev
 ```
 
-`pnpm dev` runs the Vite renderer and Electron desktop window. `pnpm start` builds the local renderer and opens the desktop app. The default API address is `https://localhost:8005`; set `HERTA_BASE_URL` before launching to use another address.
+The default HERTA API address is `https://localhost:8005`; set `HERTA_BASE_URL` before launching to use another address. Start the worker stack from Overview. The local Compose definition is `platform/compose.yaml`.
 
-## Build a desktop installer
+## Build a Windows installer
 
-On Windows, run `pnpm run dist:win`. The installer and portable executable are written to `release/`. On macOS use `pnpm run dist:mac`; on Linux use `pnpm run dist:linux`. Build each platform on that platform.
-
+Run `pnpm run dist:win`. The installer and portable executable are written to `release/`. Docker Desktop is installed separately; the HERTA installer does not install Docker or start containers automatically.

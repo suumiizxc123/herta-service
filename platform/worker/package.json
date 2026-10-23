@@ -1,0 +1,10 @@
+{
+  "name": "herta-operations-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Background HERTA integration and backup worker",
+  "dependencies": {
+    "fflate": "0.8.3",
+    "kafkajs": "2.2.4"
+  }
+}

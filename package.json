@@ -1,6 +1,6 @@
 {
   "name": "herta-operations-desktop",
-  "version": "1.7.0",
+  "version": "1.9.2",
   "description": "Desktop interface for HERTA BioCom subject and NIST file operations",
   "private": true,
   "main": "electron/main.js",
@@ -46,6 +46,24 @@
       "electron/**/*",
       "dist/renderer/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "platform",
+        "to": "platform"
+      },
+      {
+        "from": "electron/source-files.js",
+        "to": "electron/source-files.js"
+      },
+      {
+        "from": "electron/backup-archive.js",
+        "to": "electron/backup-archive.js"
+      },
+      {
+        "from": "electron/cron.js",
+        "to": "electron/cron.js"
+      }
     ],
     "win": {
       "target": [

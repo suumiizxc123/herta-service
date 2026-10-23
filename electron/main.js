@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
@@ -10,7 +10,8 @@ const { Kafka, logLevel } = require('kafkajs');
 const { createZip, inspectBackupArchive } = require('./backup-archive');
 const { MAX_FILES, safeNistName, normalizeNistSourcePayload } = require('./source-files');
 const { profileToText, subjectGroup, extractSubjectImage, extractImageFromNistBytes, summarizeSubject, makeSubjectDetails } = require('./subject-record');
-const { parseCron, matchesCron, nextCronDate } = require('./cron');
+const { parseCron, nextCronDate } = require('./cron');
+const DockerPlatform = require('./docker-platform');
 
 const APP_PAGE = path.resolve(__dirname, '../dist/renderer/index.html');
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
@@ -34,21 +35,50 @@ const subjectImageCache = new Map();
 let kafkaConsumer = null;
 let kafkaCurrent = null;
 let restReceiver = null;
-let backupSchedulerTimer = null;
-let scheduledBackupInFlight = false;
-let lastScheduledMinute = '';
 
-const defaultBackupSettings = () => ({ enabled: false, directory: '', cron: '0 2 * * *' });
+const defaultBackupSettings = () => ({ enabled: false, directory: '', cron: '0 2 * * *', retentionCount: 30 });
+
+function sessionFile() { return path.join(app.getPath('userData'), 'herta-session.enc'); }
+
+async function persistHertaSession(session) {
+  const destination = sessionFile();
+  if (!session) { await fs.rm(destination, { force: true }); return false; }
+  if (!await safeStorage.isAsyncEncryptionAvailable()) return false;
+  await fs.mkdir(path.dirname(destination), { recursive: true });
+  const encrypted = await safeStorage.encryptStringAsync(JSON.stringify(session));
+  const temporary = `${destination}.tmp`;
+  await fs.writeFile(temporary, encrypted, { mode: 0o600 });
+  await fs.rename(temporary, destination);
+  return true;
+}
+
+async function restoreHertaSession() {
+  if (!await safeStorage.isAsyncEncryptionAvailable()) return;
+  try {
+    const encrypted = await fs.readFile(sessionFile());
+    const decrypted = await safeStorage.decryptStringAsync(encrypted);
+    const restored = JSON.parse(decrypted.result);
+    if (!restored?.token || !restored?.baseUrl) throw new Error('Invalid saved session.');
+    const baseUrl = normalizeBaseUrl(restored.baseUrl);
+    const candidate = { baseUrl, token: String(restored.token), verifyTls: Boolean(restored.verifyTls) };
+    const response = await requestJson(baseUrl, candidate.verifyTls, '/api/v1/subjects?offset=0&size=1', { token: candidate.token });
+    if (!Array.isArray(response.subjects)) throw new Error('Saved HERTA session could not be verified.');
+    hertaSession = candidate;
+    await DockerPlatform.setWorkerSession(app, hertaSession);
+  } catch (error) {
+    if (error.status === 401 || error.status === 403 || error instanceof SyntaxError) await fs.rm(sessionFile(), { force: true }).catch(() => {});
+  }
+}
 
 async function readBackupSettings() {
   try {
     const value = JSON.parse(await fs.readFile(path.join(app.getPath('userData'), 'backup-settings.json'), 'utf8'));
-    return { ...defaultBackupSettings(), ...value, enabled: Boolean(value.enabled), directory: typeof value.directory === 'string' ? value.directory : '', cron: typeof value.cron === 'string' ? value.cron : '0 2 * * *' };
+    return { ...defaultBackupSettings(), ...value, enabled: Boolean(value.enabled), directory: typeof value.directory === 'string' ? value.directory : '', cron: typeof value.cron === 'string' ? value.cron : '0 2 * * *', retentionCount: Math.max(1, Math.min(365, Math.floor(Number(value.retentionCount) || 30))) };
   } catch { return defaultBackupSettings(); }
 }
 
 async function saveBackupSettings(settings) {
-  const next = { enabled: Boolean(settings?.enabled), directory: String(settings?.directory || ''), cron: String(settings?.cron || '').trim() };
+  const next = { enabled: Boolean(settings?.enabled), directory: String(settings?.directory || ''), cron: String(settings?.cron || '').trim(), retentionCount: Math.max(1, Math.min(365, Math.floor(Number(settings?.retentionCount) || 30))) };
   parseCron(next.cron);
   if (next.directory) {
     next.directory = path.resolve(next.directory);
@@ -63,26 +93,6 @@ async function saveBackupSettings(settings) {
   await fs.writeFile(temporary, JSON.stringify(next, null, 2), 'utf8');
   await fs.rename(temporary, destination);
   return next;
-}
-
-function startBackupScheduler() {
-  if (backupSchedulerTimer) return;
-  backupSchedulerTimer = setInterval(async () => {
-    if (scheduledBackupInFlight || !hertaSession?.token) return;
-    const settings = await readBackupSettings();
-    if (!settings.enabled || !settings.directory || !matchesCron(settings.cron, new Date())) return;
-    const now = new Date();
-    const minuteKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
-    if (minuteKey === lastScheduledMinute) return;
-    lastScheduledMinute = minuteKey;
-    scheduledBackupInFlight = true;
-    try {
-      await createBackup({ directory: settings.directory, scheduled: true });
-    } catch (error) {
-      await recordActivity('Automatic snapshot failed', error.message);
-      mainWindow?.webContents.send('backup:schedule-event', { ok: false, message: error.message });
-    } finally { scheduledBackupInFlight = false; }
-  }, 5000);
 }
 
 async function readAuditEvents() {
@@ -192,7 +202,7 @@ function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json
 function authorizedJson(pathname, options = {}) {
   const session = assertSignedIn();
   return requestJson(session.baseUrl, session.verifyTls, pathname, { ...options, token: session.token }).catch((error) => {
-    if (error.status === 401 || error.status === 403) hertaSession = null;
+      if (error.status === 401 || error.status === 403) { hertaSession = null; void persistHertaSession(null); void DockerPlatform.setWorkerSession(app, null); }
     throw error;
   });
 }
@@ -663,6 +673,11 @@ async function runImport({ ids, group = '0', confirmation = '' }) {
       if (state) { state.successful += 1; if (state.successful >= state.expected) state.acknowledged = true; }
     }
   }
+  for (const file of accepted) {
+    const succeededFile = rows.find((row) => row.File === file.name && row.Status === 'HTTP_SUCCESS');
+    if (!succeededFile || !file.workerInboxId) continue;
+    await DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(file.workerInboxId)}`, { method: 'DELETE' });
+  }
   await commitKafkaAcks().catch(() => {});
   await recordActivity('NIST import', `${succeeded} of ${rows.length} file imports succeeded.`);
   return { results: rows, executed: true };
@@ -721,6 +736,26 @@ function registerIpc() {
     // Verification is an explicit sign-in choice in the desktop UI.
     verifyTls: false,
   }));
+  handle('platform:status', () => DockerPlatform.platformStatus(app));
+  handle('platform:start', async (options) => {
+    const status = await DockerPlatform.startPlatform(app, options || {});
+    if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);
+    const settings = await readBackupSettings();
+      if (status.worker?.ok) await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: settings.enabled, cron: settings.cron, retentionCount: settings.retentionCount } }).catch(() => {});
+    return DockerPlatform.platformStatus(app);
+  });
+  handle('platform:stop', () => DockerPlatform.stopPlatform(app));
+  handle('platform:logs', (service) => DockerPlatform.platformLogs(app, service));
+  handle('platform:worker-call', async (operation, payload) => {
+    const endpoints = {
+      status: ['GET', '/api/status'], restFetch: ['POST', '/api/rest/fetch'], receiverStart: ['POST', '/api/receiver/start'],
+      receiverStop: ['POST', '/api/receiver/stop'], inbox: ['GET', '/api/inbox'], kafkaStart: ['POST', '/api/kafka/start'],
+      kafkaStop: ['POST', '/api/kafka/stop'], backupSettings: ['POST', '/api/backup/settings'], backupRun: ['POST', '/api/backup/run'],
+    };
+    const endpoint = endpoints[operation];
+    if (!endpoint) throw new Error('Unknown worker operation.');
+    return DockerPlatform.workerRequest(app, endpoint[1], { method: endpoint[0], body: payload, timeout: operation === 'backupRun' ? 15 * 60 * 1000 : 30000 });
+  });
   handle('herta:session', () => ({ authenticated: Boolean(hertaSession?.token), baseUrl: hertaSession?.baseUrl || '' }));
   handle('herta:login', async ({ baseUrl, username, password, verifyTls }) => {
     if (!String(username || '').trim() || !String(password || '')) throw new Error('Enter your HERTA username and password.');
@@ -734,11 +769,15 @@ function registerIpc() {
     if (!token) throw new Error('HERTA sign-in did not return an access token.');
     subjectImageCache.clear();
     hertaSession = { baseUrl: normalized, verifyTls: verified, token: String(token) };
+    await persistHertaSession(hertaSession).catch(() => false);
+    void DockerPlatform.setWorkerSession(app, hertaSession);
     await recordActivity('Signed in', 'A HERTA desktop session started.');
     return { authenticated: true, baseUrl: normalized };
   });
   handle('herta:logout', () => {
     if (hertaSession) void recordActivity('Signed out', 'The HERTA desktop session ended.');
+    void DockerPlatform.setWorkerSession(app, null);
+    void persistHertaSession(null);
     hertaSession = null; subjectImageCache.clear(); selectedFiles.clear(); void pauseKafkaSource(); return { ok: true };
   });
   handle('herta:subjects', async ({ query = '', group = '', offset = 0, limit = 40 } = {}) => {
@@ -766,24 +805,65 @@ function registerIpc() {
   handle('herta:export', exportSubjects);
   handle('herta:backup-settings', () => readBackupSettings());
   handle('herta:backup-preview', (cron) => nextCronDate(cron).toISOString());
-  handle('herta:backup-settings-save', (settings) => saveBackupSettings(settings));
+  handle('herta:backup-settings-save', async (settings) => {
+    const saved = await saveBackupSettings(settings);
+    if (saved.directory) await DockerPlatform.configureBackupMount(app, saved.directory);
+    let status = await DockerPlatform.platformStatus(app).catch(() => null);
+    if (status?.worker?.ok && saved.directory) {
+      status = await DockerPlatform.recreateWorker(app);
+      if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);
+    }
+      if (status?.worker?.ok) await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: saved.enabled, cron: saved.cron, retentionCount: saved.retentionCount } });
+    return saved;
+  });
   handle('files:pick-backup-folder', async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: 'Choose automatic HERTA backup folder', properties: ['openDirectory', 'createDirectory'] });
     return result.canceled ? '' : (result.filePaths[0] || '');
   });
-  handle('herta:backup', (options) => createBackup(options));
+  handle('herta:backup', async (options) => {
+    const status = await DockerPlatform.platformStatus(app).catch(() => null);
+    return status?.worker?.ok ? DockerPlatform.workerRequest(app, '/api/backup/run', { method: 'POST', body: {}, timeout: 15 * 60 * 1000 }) : createBackup(options);
+  });
   handle('herta:health', checkHertaHealth);
-  handle('herta:audit', async () => readAuditEvents());
-  handle('source:rest-fetch', fetchRestSource);
+  handle('herta:audit', async () => {
+    const status = await DockerPlatform.platformStatus(app).catch(() => null);
+    return status?.worker?.ok ? DockerPlatform.workerRequest(app, '/api/audit') : readAuditEvents();
+  });
+  handle('source:rest-fetch', (config) => {
+    let url = String(config?.url || '');
+    try { const target = new URL(url); if (target.hostname === 'localhost' || target.hostname === '127.0.0.1') { target.hostname = 'host.docker.internal'; url = target.toString(); } } catch { /* Worker returns the user-facing URL validation error. */ }
+    return DockerPlatform.workerRequest(app, '/api/rest/fetch', { method: 'POST', body: { ...config, url } });
+  });
   handle('source:kafka-test', testKafkaConnection);
   handle('source:kafka-create-topic', (config, topicOptions) => createKafkaTopic(config, topicOptions));
-  handle('source:kafka-start', startKafkaSource);
-  handle('source:kafka-pause', pauseKafkaSource);
-  handle('source:inbox', () => getSourceInbox());
-  handle('source:inbox-load', loadInboxFiles);
-  handle('source:inbox-discard', acknowledgeInboxItem);
-  handle('source:rest-receiver-start', startRestReceiver);
-  handle('source:rest-receiver-stop', stopRestReceiver);
+  handle('source:kafka-start', async (config) => {
+    const status = await DockerPlatform.platformStatus(app);
+    const localKafka = status.services.some((service) => service.Service === 'kafka' && /running|up/i.test(service.State || service.Status || ''));
+    const workerConfig = { ...config, brokers: String(config.brokers || '').split(',').map((broker) => {
+      const value = broker.trim();
+      if (localKafka && /^(localhost|127\.0\.0\.1):19092$/.test(value)) return 'kafka:9092';
+      return value.replace(/^(localhost|127\.0\.0\.1):(\d+)$/, 'host.docker.internal:$2');
+    }).join(',') };
+    return DockerPlatform.workerRequest(app, '/api/kafka/start', { method: 'POST', body: workerConfig });
+  });
+  handle('source:kafka-pause', () => DockerPlatform.workerRequest(app, '/api/kafka/stop', { method: 'POST', body: {} }));
+  handle('source:inbox', () => DockerPlatform.workerRequest(app, '/api/inbox'));
+  handle('source:inbox-load', async (ids) => {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Choose one or more received NIST files first.');
+    const output = [];
+    for (const id of ids) {
+      const item = await DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(id)}/content`);
+      const data = Buffer.from(item.fileContent, 'base64');
+      const fileId = crypto.randomUUID();
+      selectedFiles.set(fileId, { id: fileId, name: item.name, data, workerInboxId: item.id, kafka: item.kafka });
+      output.push({ id: fileId, name: item.name, size: data.length, lastModified: 0 });
+    }
+    if (!output.length) throw new Error('No valid worker inbox files were selected.');
+    return output;
+  });
+  handle('source:inbox-discard', (id) => DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(id)}`, { method: 'DELETE' }));
+  handle('source:rest-receiver-start', () => DockerPlatform.workerRequest(app, '/api/receiver/start', { method: 'POST', body: {} }));
+  handle('source:rest-receiver-stop', () => DockerPlatform.workerRequest(app, '/api/receiver/stop', { method: 'POST', body: {} }));
   handle('files:pick-import', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Choose HERTA NIST files',
@@ -847,14 +927,13 @@ function registerIpc() {
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
   registerIpc();
-  startBackupScheduler();
+    await restoreHertaSession();
   await createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on('before-quit', () => {
   hertaSession = null; selectedFiles.clear();
-  if (backupSchedulerTimer) clearInterval(backupSchedulerTimer);
   if (kafkaConsumer) void kafkaConsumer.disconnect().catch(() => {});
   if (restReceiver) void stopRestReceiver();
 });
