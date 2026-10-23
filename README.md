@@ -1,4 +1,4 @@
-# HERTA Operations Desktop 1.2.0
+# HERTA Operations Desktop 1.3.0
 
 An Electron desktop application for the everyday HERTA BioCom workflows in the supplied PowerShell scripts. It runs locally on the operator's computer and connects to the existing HERTA API. It does not require a browser service, Python, Docker, or a separate user database.
 

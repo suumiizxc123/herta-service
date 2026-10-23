@@ -5,12 +5,13 @@ function profileToText(profile) {
 }
 
 function subjectGroup(subject) {
-  const keys = new Set(['group', 'groupid', 'groupname', 'subjectgroup', 'subjectgroupid', 'subjectgroupname']);
+  const keys = new Set(['group', 'groups', 'groupid', 'groupids', 'groupname', 'groupnames', 'groupcode', 'subjectgroup', 'subjectgroupid', 'subjectgroupname']);
   for (const [key, raw] of Object.entries(subject)) {
     if (!keys.has(key.toLowerCase().replace(/[^a-z0-9]/g, '')) || raw == null) continue;
-    const value = typeof raw === 'object'
-      ? (raw.name ?? raw.label ?? raw.title ?? raw.code ?? raw.id)
-      : raw;
+    const labelFor = (value) => typeof value === 'object' && value !== null
+      ? (value.name ?? value.label ?? value.title ?? value.code ?? value.id)
+      : value;
+    const value = Array.isArray(raw) ? raw.map(labelFor).filter((item) => item != null && String(item).trim()).join(', ') : labelFor(raw);
     if (value != null && String(value).trim()) return String(value).trim().slice(0, 100);
   }
   return '';
@@ -42,15 +43,15 @@ function extractSubjectImage(subject, maxBytes = 1024 * 1024) {
   const walk = (value, keyHint = '', depth = 0) => {
     if (depth > 6 || value == null) return;
     if (typeof value === 'string') {
-      if (/^data:image\/(?:jpeg|jpg|png|webp|gif);base64,/i.test(value)) {
-        const encoded = value.slice(value.indexOf(',') + 1).replace(/\s+/g, '');
+      if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(value)) {
+        const encoded = value.slice(value.indexOf(',') + 1).replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
         if (encoded.length <= Math.ceil(maxBytes * 4 / 3)) {
           const bytes = Buffer.from(encoded, 'base64');
           if (bytes.length <= maxBytes) candidates.push(bytes);
         }
       } else if (/image|photo|portrait|face|picture/i.test(keyHint) || keyHint === 'profile') {
-        const encoded = value.replace(/\s+/g, '');
-        if (encoded.length >= 64 && encoded.length <= Math.ceil(maxBytes * 4 / 3) && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+        const encoded = value.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+        if (encoded.length >= 16 && encoded.length <= Math.ceil(maxBytes * 4 / 3) && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
           const bytes = Buffer.from(encoded, 'base64');
           if (bytes.length <= maxBytes) candidates.push(bytes);
         }
@@ -59,7 +60,11 @@ function extractSubjectImage(subject, maxBytes = 1024 * 1024) {
     }
     if (typeof value !== 'object' || visited.has(value)) return;
     visited.add(value);
-    if (Array.isArray(value)) { for (const item of value.slice(0, 100)) walk(item, keyHint, depth + 1); return; }
+    if (Array.isArray(value)) {
+      if (/image|photo|portrait|face|picture/i.test(keyHint) && value.length >= 16 && value.length <= maxBytes && value.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) candidates.push(Buffer.from(value));
+      else for (const item of value.slice(0, 100)) walk(item, keyHint, depth + 1);
+      return;
+    }
     for (const [key, nested] of Object.entries(value).slice(0, 200)) walk(nested, /image|photo|portrait|face|picture/i.test(key) ? key : keyHint, depth + 1);
   };
   walk(parsed);

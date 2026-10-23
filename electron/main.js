@@ -10,6 +10,7 @@ const { Kafka, logLevel } = require('kafkajs');
 const { createZip, inspectBackupArchive } = require('./backup-archive');
 const { MAX_FILES, safeNistName, normalizeNistSourcePayload } = require('./source-files');
 const { profileToText, subjectGroup, extractSubjectImage, summarizeSubject, makeSubjectDetails } = require('./subject-record');
+const { parseCron, matchesCron, nextCronDate } = require('./cron');
 
 const APP_PAGE = path.resolve(__dirname, '../dist/renderer/index.html');
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
@@ -32,6 +33,58 @@ let subjectCache = [];
 let kafkaConsumer = null;
 let kafkaCurrent = null;
 let restReceiver = null;
+let backupSchedulerTimer = null;
+let scheduledBackupInFlight = false;
+let lastScheduledMinute = '';
+
+const defaultBackupSettings = () => ({ enabled: false, directory: '', cron: '0 2 * * *' });
+
+async function readBackupSettings() {
+  try {
+    const value = JSON.parse(await fs.readFile(path.join(app.getPath('userData'), 'backup-settings.json'), 'utf8'));
+    return { ...defaultBackupSettings(), ...value, enabled: Boolean(value.enabled), directory: typeof value.directory === 'string' ? value.directory : '', cron: typeof value.cron === 'string' ? value.cron : '0 2 * * *' };
+  } catch { return defaultBackupSettings(); }
+}
+
+async function saveBackupSettings(settings) {
+  const next = { enabled: Boolean(settings?.enabled), directory: String(settings?.directory || ''), cron: String(settings?.cron || '').trim() };
+  parseCron(next.cron);
+  if (next.directory) {
+    next.directory = path.resolve(next.directory);
+    const stat = await fs.stat(next.directory).catch(() => null);
+    if (!stat?.isDirectory()) throw new Error('Choose an existing backup destination folder.');
+  }
+  if (next.enabled && !next.directory) throw new Error('Choose a backup destination before enabling automatic backups.');
+  const folder = app.getPath('userData');
+  await fs.mkdir(folder, { recursive: true });
+  const destination = path.join(folder, 'backup-settings.json');
+  const temporary = `${destination}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify(next, null, 2), 'utf8');
+  await fs.rename(temporary, destination);
+  return next;
+}
+
+function startBackupScheduler() {
+  if (backupSchedulerTimer) return;
+  backupSchedulerTimer = setInterval(async () => {
+    if (scheduledBackupInFlight || !hertaSession?.token) return;
+    const settings = await readBackupSettings();
+    if (!settings.enabled || !settings.directory || !matchesCron(settings.cron, new Date())) return;
+    const now = new Date();
+    const minuteKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
+    if (minuteKey === lastScheduledMinute) return;
+    lastScheduledMinute = minuteKey;
+    scheduledBackupInFlight = true;
+    try {
+      const result = await createBackup({ directory: settings.directory, scheduled: true });
+      const succeeded = result.rows.filter((row) => row.Status === 'Success').length;
+      await recordActivity('Automatic snapshot created', `${succeeded} of ${result.rows.length} subjects exported to ${result.path}.`);
+    } catch (error) {
+      await recordActivity('Automatic snapshot failed', error.message);
+      mainWindow?.webContents.send('backup:schedule-event', { ok: false, message: error.message });
+    } finally { scheduledBackupInFlight = false; }
+  }, 5000);
+}
 
 async function readAuditEvents() {
   if (auditCache) return auditCache;
@@ -200,7 +253,7 @@ async function profileCheck() {
   return results;
 }
 
-async function exportSubjects(codes, { backup = false } = {}) {
+async function exportSubjects(codes, { backup = false, destinationDirectory = '' } = {}) {
   assertSignedIn();
   if (!Array.isArray(codes) || !codes.length) throw new Error('Select at least one subject to export.');
   if (codes.length > MAX_FILE_COUNT) throw new Error(`Export up to ${MAX_FILE_COUNT} subjects at a time.`);
@@ -240,25 +293,36 @@ async function exportSubjects(codes, { backup = false } = {}) {
     }, null, 2), 'utf8') });
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const result = await dialog.showSaveDialog(mainWindow, {
-    title: backup ? 'Save HERTA snapshot backup' : 'Save HERTA NIST exports',
-    defaultPath: path.join(app.getPath('downloads'), backup ? `herta-snapshot-${stamp}.zip` : 'herta-exports.zip'),
-    filters: [{ name: 'ZIP archive', extensions: ['zip'] }],
-  });
-  if (result.canceled || !result.filePath) return { canceled: true, rows };
-  await fs.writeFile(result.filePath, createZip(files));
+  let filePath;
+  if (destinationDirectory) {
+    const directoryStat = await fs.stat(destinationDirectory).catch(() => null);
+    if (!directoryStat?.isDirectory()) throw new Error('The configured backup destination is unavailable. Choose another folder.');
+    filePath = path.join(destinationDirectory, `${backup ? 'herta-snapshot' : 'herta-export'}-${stamp}.zip`);
+  } else {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: backup ? 'Save HERTA snapshot backup' : 'Save HERTA NIST exports',
+      defaultPath: path.join(app.getPath('downloads'), backup ? `herta-snapshot-${stamp}.zip` : 'herta-exports.zip'),
+      filters: [{ name: 'ZIP archive', extensions: ['zip'] }],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true, rows };
+    filePath = result.filePath;
+  }
+  const archive = createZip(files);
+  if (archive.length > MAX_BACKUP_BYTES) throw new Error('Snapshot ZIP exceeds the 256 MiB limit.');
+  await fs.writeFile(filePath, archive);
   const succeeded = rows.filter((row) => row.Status === 'Success').length;
   await recordActivity(backup ? 'Snapshot created' : 'NIST export', `${succeeded} of ${rows.length} subject files exported.`);
-  return { canceled: false, path: result.filePath, rows };
+  return { canceled: false, path: filePath, rows };
 }
 
-async function createBackup() {
+async function createBackup({ directory = '', scheduled = false } = {}) {
   const subjects = await getAllSubjects();
   if (!subjects.length) throw new Error('HERTA has no subjects to include in a snapshot.');
   if (subjects.length > MAX_FILE_COUNT) {
     throw new Error(`This desktop snapshot supports up to ${MAX_FILE_COUNT} subjects per ZIP. HERTA currently has ${subjects.length}.`);
   }
-  return exportSubjects(subjects.map((subject) => String(subject.code || '')).filter(Boolean), { backup: true });
+  if (scheduled && !hertaSession?.token) throw new Error('Sign in to HERTA before the scheduled backup time.');
+  return exportSubjects(subjects.map((subject) => String(subject.code || '')).filter(Boolean), { backup: true, destinationDirectory: directory });
 }
 
 async function checkHertaHealth() {
@@ -680,7 +744,13 @@ function registerIpc() {
   handle('herta:subject-detail', getSubjectDetails);
   handle('herta:profiles', profileCheck);
   handle('herta:export', exportSubjects);
-  handle('herta:backup', createBackup);
+  handle('herta:backup-settings', () => readBackupSettings());
+  handle('herta:backup-settings-save', (settings) => saveBackupSettings(settings));
+  handle('files:pick-backup-folder', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, { title: 'Choose automatic HERTA backup folder', properties: ['openDirectory', 'createDirectory'] });
+    return result.canceled ? '' : (result.filePaths[0] || '');
+  });
+  handle('herta:backup', (options) => createBackup(options));
   handle('herta:health', checkHertaHealth);
   handle('herta:audit', async () => readAuditEvents());
   handle('source:rest-fetch', fetchRestSource);
@@ -756,12 +826,14 @@ function registerIpc() {
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
   registerIpc();
+  startBackupScheduler();
   await createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on('before-quit', () => {
   hertaSession = null; selectedFiles.clear();
+  if (backupSchedulerTimer) clearInterval(backupSchedulerTimer);
   if (kafkaConsumer) void kafkaConsumer.disconnect().catch(() => {});
   if (restReceiver) void stopRestReceiver();
 });
