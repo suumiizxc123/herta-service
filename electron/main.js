@@ -965,7 +965,7 @@ function registerIpc() {
       const data = Buffer.from(item.fileContent, 'base64');
       const fileId = crypto.randomUUID();
       selectedFiles.set(fileId, { id: fileId, name: item.name, data, workerInboxId: item.id, kafka: item.kafka });
-      output.push({ id: fileId, name: item.name, size: data.length, lastModified: 0 });
+      output.push({ id: fileId, name: item.name, size: data.length, source: item.source, sourceType: item.sourceType, connectorId: item.connectorId, lastModified: 0 });
     }
     if (!output.length) throw new Error('No valid worker inbox files were selected.');
     return output;

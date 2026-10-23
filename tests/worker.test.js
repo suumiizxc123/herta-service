@@ -80,6 +80,8 @@ test('Docker worker exposes an authenticated status API and persists REST inbox 
   const items = await (await fetch(`${base}/api/inbox`, { headers: { Authorization: `Bearer ${apiToken}` } })).json();
   assert.equal(items.length, 1);
   assert.equal(items[0].name, 'SUB001.nist');
+  assert.equal(items[0].sourceType, 'rest');
+  assert.equal(items[0].connectorId, 'receiver-test');
 
   child.kill();
   await new Promise((resolve) => child.once('exit', resolve));
@@ -167,4 +169,16 @@ test('REST connector test validates a NIST batch without enqueueing it', async (
   assert.equal(result.count, 1);
   assert.equal(result.bytes, Buffer.from('sample ANSI-NIST').length);
   assert.deepEqual(await (await fetch(`${base}/api/inbox`, { headers })).json(), []);
+  const fetched = await fetch(`${base}/api/rest/fetch`, { method: 'POST', headers, body: JSON.stringify({ connectorId: 'rest-check' }) });
+  assert.equal(fetched.status, 200);
+  const batch = await fetched.json();
+  assert.equal(batch.count, 1);
+  assert.equal(batch.files[0].sourceType, 'rest');
+  assert.equal(batch.files[0].connectorId, 'rest-check');
+  const content = await (await fetch(`${base}/api/inbox/${batch.files[0].id}/content`, { headers })).json();
+  assert.equal(content.fileContent, sample);
+  assert.equal(content.connectorId, 'rest-check');
+  const repeated = await (await fetch(`${base}/api/rest/fetch`, { method: 'POST', headers, body: JSON.stringify({ connectorId: 'rest-check' }) })).json();
+  assert.equal(repeated.count, 0);
+  assert.equal((await (await fetch(`${base}/api/inbox`, { headers })).json()).length, 1);
 });

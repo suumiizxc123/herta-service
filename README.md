@@ -1,4 +1,6 @@
-# HERTA Operations Desktop 1.9.19
+# HERTA Operations Desktop 1.9.20
+
+The Import workspace includes Files, REST API and Kafka sources. Manage saved source connections, fetch REST data, select received items and preview or import a batch on one screen. Run **Dashboard → Apply / start** after updating the desktop app to build the worker with connector-specific queue metadata and duplicate checks for manual REST fetches.
 
 Electron is the control interface. A Docker Compose worker handles REST intake, Kafka consumption, the persistent review inbox, and scheduled NIST ZIP backups independently of the Electron window. Windows requires Docker Desktop with its engine running; install/start Docker Desktop before using **Start workers** on the Dashboard page.
 

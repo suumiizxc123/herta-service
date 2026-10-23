@@ -58,7 +58,7 @@ async function saveInbox() {
   const entries = [...inbox.values()].map(({ data, file, ...entry }) => ({ ...entry, ...(file ? { file: path.basename(file) } : {}) }));
   await writeJson(path.join(DATA_DIR, 'inbox.json'), entries);
 }
-function inboxSummary(entry) { return { id: entry.id, name: entry.name, size: entry.data?.length || 0, source: entry.source, error: entry.error || '', kafka: entry.kafka || null, createdAt: entry.createdAt || null }; }
+function inboxSummary(entry) { return { id: entry.id, name: entry.name, size: entry.data?.length || 0, source: entry.source, sourceType: entry.sourceType || (entry.kafka || /^Kafka\b/i.test(entry.source || '') ? 'kafka' : /^REST\b/i.test(entry.source || '') ? 'rest' : 'unknown'), connectorId: entry.connectorId || '', error: entry.error || '', kafka: entry.kafka || null, createdAt: entry.createdAt || null }; }
 
 async function recordQueueEvent(item, outcome, message = '') {
   queueHistory = [{ at: new Date().toISOString(), outcome, name: item?.name || '', source: item?.source || 'Unknown source', size: item?.data?.length || item?.size || 0, message: String(message).slice(0, 300) }, ...queueHistory].slice(0, 2000);
@@ -95,7 +95,7 @@ async function stopConnectorRuntimes() {
 
 function saveRuntime(id, patch) { connectorRuntimes.set(id, { ...(connectorRuntimes.get(id) || {}), ...patch }); }
 
-async function pollRestConnector(connector) {
+async function pollRestConnector(connector, { throwOnError = false } = {}) {
   const runtime = connectorRuntimes.get(connector.id) || {};
   try {
     const target = new URL(String(connector.config?.url || ''));
@@ -109,15 +109,17 @@ async function pollRestConnector(connector) {
       seen.add(fingerprint); return true;
     });
     connector.seen = [...seen].slice(-3000);
-    const ids = fresh.length ? await addFiles(fresh, `REST · ${connector.name}`) : [];
+    const ids = fresh.length ? await addFiles(fresh, `REST · ${connector.name}`, null, connector.id) : [];
     await persistConnectors();
     const now = new Date(); const interval = Math.max(15, Math.min(86400, Number(connector.config.pollEverySeconds) || 60));
-    saveRuntime(connector.id, { status: 'active', lastRunAt: now.toISOString(), lastError: '', received: (runtime.received || 0) + ids.length, nextRunAt: new Date(now.getTime() + interval * 1000).toISOString() });
+    saveRuntime(connector.id, { status: connector.active ? 'active' : 'inactive', lastRunAt: now.toISOString(), lastError: '', received: (runtime.received || 0) + ids.length, nextRunAt: connector.active ? new Date(now.getTime() + interval * 1000).toISOString() : null });
     if (ids.length) await recordConnectorEvent(connector, 'Files received', 'success', `${ids.length} file(s) from REST.`);
+    return { count: ids.length, files: ids.map((id) => inboxSummary(inbox.get(id))) };
   } catch (error) {
     const interval = Math.max(15, Math.min(86400, Number(connector.config?.pollEverySeconds) || 60));
     saveRuntime(connector.id, { status: 'error', lastRunAt: new Date().toISOString(), lastError: error.message, nextRunAt: new Date(Date.now() + interval * 1000).toISOString() });
     if (runtime.lastError !== error.message) await recordConnectorEvent(connector, 'Poll failed', 'error', error.message);
+    if (throwOnError) throw error;
   }
 }
 
@@ -129,7 +131,7 @@ async function startRestPolling(connector) {
   timer.unref?.(); restPollers.set(connector.id, timer);
 }
 
-async function addFiles(files, source, kafka = null) {
+async function addFiles(files, source, kafka = null, connectorId = '') {
   if (inbox.size + files.length > 500) throw new Error('The worker inbox is limited to 500 files.');
   let batchBytes = 0;
   for (const file of files) { batchBytes += file.data.length; if (file.data.length > MAX_FILE_BYTES || batchBytes > MAX_BATCH_BYTES) throw new Error('NIST intake is limited to 32 MiB per file and 256 MiB per batch.'); }
@@ -140,7 +142,7 @@ async function addFiles(files, source, kafka = null) {
     const filename = `${id}.nist`;
     const file = path.join(INBOX_DIR, filename);
     await fs.writeFile(file, item.data, { mode: 0o600, flag: 'wx' });
-    const entry = { id, name, size: item.data.length, source, kafka, file: filename, createdAt: new Date().toISOString() };
+    const entry = { id, name, size: item.data.length, source, sourceType: kafka ? 'kafka' : /^REST\b/i.test(source) ? 'rest' : 'unknown', connectorId, kafka, file: filename, createdAt: new Date().toISOString() };
     inbox.set(id, { ...entry, data: item.data, file }); ids.push(id);
   }
   await saveInbox();
@@ -345,14 +347,14 @@ async function startKafka(input) {
         catch { throw new Error('This message is not valid JSON. Expected a JSON NIST envelope with a Base64 fileContent field. If the topic contains raw NIST bytes, change Message format to “Raw NIST bytes”.'); }
         files = normalizeNistSourcePayload(payload);
       }
-      await addFiles(files, `Kafka · ${topic}`, { topic, partition, offset: message.offset });
+      await addFiles(files, `Kafka · ${topic}`, { topic, partition, offset: message.offset }, connectorId);
       const runtime = connectorRuntimes.get(connectorId) || {};
       saveRuntime(connectorId, { status: 'active', lastRunAt: new Date().toISOString(), lastError: '', received: (runtime.received || 0) + files.length });
       await recordConnectorEvent(connectors.find((item) => item.id === connectorId), 'Messages received', 'success', `${files.length} file(s) from ${topic}.`);
     } catch (error) {
       const runtime = connectorRuntimes.get(connectorId) || {};
       saveRuntime(connectorId, { status: 'error', lastRunAt: new Date().toISOString(), lastError: error.message, received: runtime.received || 0 });
-      const id = crypto.randomUUID(); inbox.set(id, { id, name: `${topic}-${partition}-${message.offset}`, size: 0, source: `Kafka · ${topic}`, kafka: { topic, partition, offset: message.offset }, error: error.message, createdAt: new Date().toISOString() }); await saveInbox();
+      const id = crypto.randomUUID(); inbox.set(id, { id, name: `${topic}-${partition}-${message.offset}`, size: 0, source: `Kafka · ${topic}`, sourceType: 'kafka', connectorId, kafka: { topic, partition, offset: message.offset }, error: error.message, createdAt: new Date().toISOString() }); await saveInbox();
       await recordQueueEvent(inbox.get(id), 'failed', error.message);
       await recordConnectorEvent(connectors.find((item) => item.id === connectorId), 'Message failed', 'error', error.message);
     }
@@ -477,7 +479,7 @@ async function route(request, response) {
         if (!body.length || body.length > MAX_FILE_BYTES) throw new Error('Raw NIST data must be 1 byte to 32 MiB.');
         files = [{ name: safeNistName(request.headers['x-file-name']), data: body }];
       } else files = normalizeNistSourcePayload(JSON.parse(body.toString('utf8')));
-    const ids = await addFiles(files, 'REST receiver');
+    const ids = await addFiles(files, 'REST receiver', null, receiverConnectorId);
     if (receiverConnectorId) {
       const runtime = connectorRuntimes.get(receiverConnectorId) || {};
       saveRuntime(receiverConnectorId, { status: 'active', lastRunAt: new Date().toISOString(), lastError: '', received: (runtime.received || 0) + ids.length });
@@ -556,7 +558,7 @@ async function route(request, response) {
     }
     if (request.method === 'GET' && url.pathname.startsWith('/api/inbox/') && url.pathname.endsWith('/content')) {
       const id = url.pathname.split('/')[3]; const item = inbox.get(id); if (!item?.data) return json(response, 404, { error: 'Inbox file is unavailable.' });
-      return json(response, 200, { id, name: item.name, source: item.source, fileContent: item.data.toString('base64'), kafka: item.kafka });
+      return json(response, 200, { ...inboxSummary(item), fileContent: item.data.toString('base64') });
     }
     if (request.method === 'DELETE' && url.pathname.startsWith('/api/inbox/')) {
       const id = url.pathname.split('/').pop(); const item = inbox.get(id);
@@ -571,6 +573,11 @@ async function route(request, response) {
     }
     if (request.method === 'POST' && url.pathname === '/api/rest/fetch') {
       const body = JSON.parse((await readBody(request)).toString('utf8'));
+      if (body.connectorId) {
+        const connector = connectors.find((item) => item.id === String(body.connectorId) && item.type === 'rest' && item.mode !== 'receiver');
+        if (!connector) throw new Error('Select a saved REST API pull source.');
+        return json(response, 200, await pollRestConnector(connector, { throwOnError: true }));
+      }
       const target = new URL(String(body.url || ''));
       if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
       const result = await requestJson(target.toString(), Boolean(body.verifyTls), target.toString(), { token: String(body.bearerToken || '') || undefined });
