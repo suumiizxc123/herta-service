@@ -1,0 +1,485 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Activity, ArrowDownToLine, ArrowRight, ArchiveRestore, CheckCircle2, CircleHelp,
+  Cloud, Database, FileArchive, FileCheck2, Fingerprint, FolderOpen, HeartPulse,
+  Eye, History, LayoutDashboard, LoaderCircle, LogOut, Pause, Play, Plus, Radio,
+  RefreshCw, Search, Server, ShieldCheck, Upload, Users, X,
+} from 'lucide-react';
+import { Badge } from './components/ui/badge.jsx';
+import { Button } from './components/ui/button.jsx';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card.jsx';
+import { Checkbox } from './components/ui/checkbox.jsx';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from './components/ui/dialog.jsx';
+import { Input } from './components/ui/input.jsx';
+import { Separator } from './components/ui/separator.jsx';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table.jsx';
+
+const navItems = [
+  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+  { id: 'subjects', label: 'Subjects', icon: Users },
+  { id: 'import', label: 'NIST import', icon: Upload },
+  { id: 'profiles', label: 'Profile check', icon: Fingerprint },
+  { id: 'backups', label: 'Backup & restore', icon: ArchiveRestore },
+  { id: 'health', label: 'System health', icon: HeartPulse },
+  { id: 'activity', label: 'Audit activity', icon: History },
+  { id: 'integrations', label: 'Integrations', icon: Radio },
+];
+const titleFor = Object.fromEntries(navItems.map(({ id, label }) => [id, label]));
+const formatSize = (size = 0) => size < 1024 * 1024 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 / 1024).toFixed(2)} MB`;
+
+export default function App() {
+  const [config, setConfig] = useState({ baseUrl: 'https://localhost:8005', verifyTls: false });
+  const [session, setSession] = useState({ authenticated: false, baseUrl: '' });
+  const [view, setView] = useState('overview');
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [toast, setToast] = useState(null);
+  const [subjects, setSubjects] = useState([]);
+  const [serverCount, setServerCount] = useState(0);
+  const [subjectQuery, setSubjectQuery] = useState('');
+  const [selected, setSelected] = useState(() => new Set());
+  const [files, setFiles] = useState([]);
+  const [group, setGroup] = useState('0');
+  const [importRows, setImportRows] = useState([]);
+  const [importExecuted, setImportExecuted] = useState(false);
+  const [restoreSource, setRestoreSource] = useState(false);
+  const [profiles, setProfiles] = useState([]);
+  const [profileError, setProfileError] = useState('');
+  const [health, setHealth] = useState(null);
+  const [healthError, setHealthError] = useState('');
+  const [auditEvents, setAuditEvents] = useState([]);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState('');
+  const [subjectDetails, setSubjectDetails] = useState(null);
+  const [subjectDetailsLoading, setSubjectDetailsLoading] = useState(false);
+  const [profileRevealed, setProfileRevealed] = useState(false);
+  const [restSource, setRestSource] = useState({ url: '', bearerToken: '', verifyTls: true });
+  const [kafkaSource, setKafkaSource] = useState({ brokers: 'localhost:9092', topic: 'herta.nist', groupId: 'herta-operations-desktop', tls: false, verifyTls: true, mechanism: 'none', username: '', password: '', messageFormat: 'json-base64', partitions: '1', replicationFactor: '1' });
+  const [kafkaStatus, setKafkaStatus] = useState(null);
+  const [kafkaListening, setKafkaListening] = useState(false);
+  const [sourceInbox, setSourceInbox] = useState([]);
+  const [inboxSelection, setInboxSelection] = useState(() => new Set());
+  const [receiver, setReceiver] = useState({ running: false, port: '8006', token: '' });
+  const [integrationMessage, setIntegrationMessage] = useState('');
+
+  const invoke = useCallback(async (method, ...args) => {
+    try { return await window.herta[method](...args); }
+    catch (error) { throw new Error(error?.message || 'The operation failed.'); }
+  }, []);
+
+  const notify = useCallback((message, error = false) => {
+    setToast({ message, error });
+    window.clearTimeout(notify.timer);
+    notify.timer = window.setTimeout(() => setToast(null), 4200);
+  }, []);
+
+  const loadSubjects = useCallback(async (query = '') => {
+    setLoading(true);
+    try {
+      const result = await invoke('listSubjects', { query });
+      setSubjects(result.subjects || []);
+      setServerCount(result.server_count || 0);
+      setSelected((current) => new Set([...current].filter((code) => result.subjects?.some((item) => item.code === code))));
+      return result;
+    } catch (error) {
+      notify(error.message, true);
+      throw error;
+    } finally { setLoading(false); }
+  }, [invoke, notify]);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const initialConfig = await invoke('getConfig');
+        const currentSession = await invoke('getSession');
+        if (!mounted) return;
+        setConfig({ ...initialConfig, verifyTls: false });
+        setSession(currentSession);
+        if (currentSession.authenticated) loadSubjects();
+      } catch (error) { if (mounted) setNotice(error.message); }
+    })();
+    return () => { mounted = false; };
+  }, [invoke, loadSubjects]);
+
+  useEffect(() => {
+    if (view !== 'subjects' || !session.authenticated) return undefined;
+    const timer = window.setTimeout(() => loadSubjects(subjectQuery).catch(() => {}), 250);
+    return () => window.clearTimeout(timer);
+  }, [subjectQuery, view, session.authenticated, loadSubjects]);
+
+  const connect = async (event) => {
+    event.preventDefault();
+    setLoading(true); setNotice('');
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    try {
+      const connected = await invoke('login', {
+        baseUrl: form.get('base_url'), username: form.get('username'), password: form.get('password'), verifyTls: config.verifyTls,
+      });
+      setSession({ authenticated: true, baseUrl: connected.baseUrl });
+      setConfig((current) => ({ ...current, baseUrl: connected.baseUrl }));
+      formElement.reset();
+      notify('Connected to HERTA.');
+      await loadSubjects();
+    } catch (error) {
+      setNotice(error.message);
+    } finally { setLoading(false); }
+  };
+
+  const signOut = async () => {
+    try { await invoke('logout'); } catch { /* Local view is cleared even when HERTA is unavailable. */ }
+    setSession({ authenticated: false, baseUrl: '' }); setSubjects([]); setSelected(new Set()); setFiles([]); setView('overview');
+  };
+
+  const toggleSubject = (code, checked) => setSelected((current) => {
+    const next = new Set(current);
+    if (checked) next.add(code); else next.delete(code);
+    return next;
+  });
+
+  const showSubjectDetails = async (code) => {
+    setSubjectDetails({ loading: true, code });
+    setProfileRevealed(false);
+    setSubjectDetailsLoading(true);
+    try { setSubjectDetails(await invoke('getSubjectDetails', code)); }
+    catch (error) { setSubjectDetails({ error: error.message, code }); }
+    finally { setSubjectDetailsLoading(false); }
+  };
+
+  const exportSelected = async () => {
+    if (!selected.size) return notify('Select at least one subject first.', true);
+    setLoading(true);
+    try {
+      const result = await invoke('exportSubjects', [...selected]);
+      const succeeded = result.rows?.filter((row) => row.Status === 'Success').length || 0;
+      if (!result.canceled) notify(`${succeeded} NIST file${succeeded === 1 ? '' : 's'} saved with a CSV report.`);
+    } catch (error) { notify(error.message, true); }
+    finally { setLoading(false); }
+  };
+
+  const chooseFiles = async () => {
+    try { setFiles(await invoke('pickImportFiles')); setImportRows([]); setRestoreSource(false); }
+    catch (error) { notify(error.message, true); }
+  };
+
+  const previewImport = async () => {
+    if (!files.length) return;
+    setLoading(true);
+    try {
+      const result = await invoke('previewImport', files.map((file) => file.id), group || '0');
+      setImportRows(result.results || []); setImportExecuted(false); notify('Preview is ready. No files were sent.');
+    } catch (error) { notify(error.message, true); }
+    finally { setLoading(false); }
+  };
+
+  const runImport = async () => {
+    setLoading(true);
+    try {
+      const result = await invoke('importFiles', { ids: files.map((file) => file.id), group: group || '0', confirmation: confirmText });
+      setImportRows(result.results || []); setImportExecuted(true); setConfirmOpen(false); setConfirmText(''); setRestoreSource(false);
+      const succeeded = result.results?.filter((row) => row.Status === 'HTTP_SUCCESS').length || 0;
+      notify(`${succeeded} import request${succeeded === 1 ? '' : 's'} succeeded. Verify records in HERTA.`);
+    } catch (error) { notify(error.message, true); }
+    finally { setLoading(false); }
+  };
+
+  const saveImportReport = async () => {
+    if (!importRows.length) return notify('Run a preview or import before saving a report.', true);
+    try { const result = await invoke('saveReport', { rows: importRows, kind: 'import' }); if (!result.canceled) notify(`Report saved to ${result.path}`); }
+    catch (error) { notify(error.message, true); }
+  };
+
+  const runProfileCheck = async () => {
+    setLoading(true); setProfileError('');
+    try { setProfiles(await invoke('profileCheck')); }
+    catch (error) { setProfileError(error.message); }
+    finally { setLoading(false); }
+  };
+
+  const createSnapshot = async () => {
+    setLoading(true);
+    try {
+      const result = await invoke('createBackup');
+      if (!result.canceled) {
+        const succeeded = result.rows?.filter((row) => row.Status === 'Success').length || 0;
+        notify(`Snapshot saved. ${succeeded} of ${result.rows?.length || 0} subjects exported.`);
+        setAuditEvents(await invoke('getAuditEvents'));
+      }
+    } catch (error) { notify(error.message, true); }
+    finally { setLoading(false); }
+  };
+
+  const restoreSnapshot = async () => {
+    setLoading(true);
+    try {
+      const restoredFiles = await invoke('pickBackupFiles');
+      if (restoredFiles.length) {
+        setFiles(restoredFiles); setImportRows([]); setImportExecuted(false); setRestoreSource(true); setView('import');
+        notify(`${restoredFiles.length} NIST files loaded. Preview them before restoring.`);
+      }
+    } catch (error) { notify(error.message, true); }
+    finally { setLoading(false); }
+  };
+
+  const refreshHealth = useCallback(async () => {
+    setHealth(null); setHealthError('');
+    try { setHealth(await invoke('checkHealth')); }
+    catch (error) { setHealthError(error.message); }
+  }, [invoke]);
+
+  const refreshAudit = useCallback(async () => {
+    try { setAuditEvents(await invoke('getAuditEvents')); }
+    catch (error) { notify(error.message, true); }
+  }, [invoke, notify]);
+
+  const refreshInbox = useCallback(async () => {
+    try { setSourceInbox(await invoke('getSourceInbox')); }
+    catch (error) { setIntegrationMessage(error.message); }
+  }, [invoke]);
+
+  useEffect(() => {
+    if (view === 'health') refreshHealth();
+    if (view === 'activity') refreshAudit();
+    if (view === 'backups') refreshAudit();
+    if (view === 'integrations') refreshInbox();
+  }, [view, refreshHealth, refreshAudit, refreshInbox]);
+
+  useEffect(() => {
+    if (view !== 'integrations') return undefined;
+    const timer = window.setInterval(refreshInbox, 1800);
+    return () => window.clearInterval(timer);
+  }, [view, refreshInbox]);
+
+  const fetchRest = async () => {
+    setLoading(true); setIntegrationMessage('');
+    try { const result = await invoke('fetchRestSource', restSource); setSourceInbox(await invoke('getSourceInbox')); setInboxSelection(new Set(result.files.map((file) => file.id))); notify(`${result.count} NIST file${result.count === 1 ? '' : 's'} received from REST.`); }
+    catch (error) { setIntegrationMessage(error.message); }
+    finally { setLoading(false); }
+  };
+
+  const checkKafka = async () => {
+    setLoading(true); setIntegrationMessage('');
+    try { setKafkaStatus(await invoke('testKafkaConnection', kafkaSource)); setIntegrationMessage('Kafka broker connection succeeded.'); }
+    catch (error) { setKafkaStatus(null); setIntegrationMessage(error.message); }
+    finally { setLoading(false); }
+  };
+
+  const createTopic = async () => {
+    setLoading(true); setIntegrationMessage('');
+    try { const result = await invoke('createKafkaTopic', kafkaSource, { partitions: kafkaSource.partitions, replicationFactor: kafkaSource.replicationFactor }); setIntegrationMessage(result.created ? `Topic “${result.topic}” created.` : `Topic “${result.topic}” already exists.`); setKafkaStatus(await invoke('testKafkaConnection', kafkaSource)); }
+    catch (error) { setIntegrationMessage(error.message); }
+    finally { setLoading(false); }
+  };
+
+  const toggleKafka = async () => {
+    setLoading(true); setIntegrationMessage('');
+    try {
+      if (kafkaListening) { await invoke('pauseKafkaSource'); setKafkaListening(false); setIntegrationMessage('Kafka listener paused.'); }
+      else { await invoke('startKafkaSource', kafkaSource); setKafkaListening(true); setIntegrationMessage(`Listening to ${kafkaSource.topic}. Incoming NIST records appear in the inbox.`); }
+    } catch (error) { setIntegrationMessage(error.message); }
+    finally { setLoading(false); }
+  };
+
+  const loadReceived = async () => {
+    setLoading(true);
+    try { const result = await invoke('loadInboxFiles', [...inboxSelection]); setFiles(result); setImportRows([]); setImportExecuted(false); setRestoreSource(false); setView('import'); notify(`${result.length} received NIST file${result.length === 1 ? '' : 's'} ready to preview.`); }
+    catch (error) { notify(error.message, true); }
+    finally { setLoading(false); }
+  };
+
+  const discardInboxItem = async (id) => {
+    try { await invoke('discardInboxItem', id); await refreshInbox(); }
+    catch (error) { setIntegrationMessage(error.message); }
+  };
+
+  const startReceiver = async () => {
+    setLoading(true); setIntegrationMessage('');
+    try { const result = await invoke('startRestReceiver', { port: Number(receiver.port) }); setReceiver((current) => ({ ...current, ...result })); }
+    catch (error) { setIntegrationMessage(error.message); }
+    finally { setLoading(false); }
+  };
+
+  const stopReceiver = async () => {
+    try { await invoke('stopRestReceiver'); setReceiver((current) => ({ ...current, running: false, token: '' })); }
+    catch (error) { setIntegrationMessage(error.message); }
+  };
+
+  const selectedAll = subjects.length > 0 && subjects.every((subject) => selected.has(subject.code));
+  const lastSnapshot = auditEvents.find((event) => event.action === 'Snapshot created');
+  const headerAction = view === 'subjects' ? <Button variant="outline" onClick={exportSelected} disabled={loading || !selected.size}><ArrowDownToLine /> Export {selected.size || ''}</Button>
+    : view === 'import' ? <Button onClick={chooseFiles}><FolderOpen /> Choose files</Button>
+      : view === 'profiles' ? <Button onClick={runProfileCheck} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <RefreshCw />} Run check</Button>
+        : view === 'backups' ? <Button onClick={createSnapshot} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <ArchiveRestore />} Create snapshot</Button>
+          : view === 'health' ? <Button variant="outline" onClick={refreshHealth}><RefreshCw /> Check now</Button>
+              : view === 'activity' ? <Button variant="outline" onClick={refreshAudit}><RefreshCw /> Refresh log</Button>
+              : view === 'integrations' ? <Button variant="outline" onClick={refreshInbox}><RefreshCw /> Refresh inbox</Button>
+              : <Button variant="outline" onClick={() => loadSubjects().catch(() => {})} disabled={loading}><RefreshCw className={loading ? 'animate-spin' : ''} /> Refresh</Button>;
+
+  const topMetric = useMemo(() => [
+    { label: 'Total subjects', value: serverCount.toLocaleString(), icon: Users, note: 'In HERTA' },
+    { label: 'Selected', value: selected.size.toLocaleString(), icon: CheckCircle2, note: 'Ready to export' },
+    { label: 'Import queue', value: files.length.toLocaleString(), icon: FileArchive, note: 'NIST files' },
+  ], [serverCount, selected.size, files.length]);
+
+  if (!session.authenticated) return <Login config={config} setConfig={setConfig} notice={notice} loading={loading} onSubmit={connect} />;
+
+  return <div className="flex min-h-screen bg-background text-foreground">
+    <aside className="sidebar flex w-[248px] shrink-0 flex-col border-r border-slate-200 px-4 py-5">
+      <div className="flex items-center gap-3 px-2 pb-8 pt-1">
+        <div className="flex size-10 items-center justify-center rounded-xl bg-[#eaf1f7] text-[#315a80]"><Fingerprint className="size-6" /></div>
+        <div><div className="text-[15px] font-semibold tracking-wide text-[#203348]">HERTA</div><div className="mt-0.5 text-[11px] text-slate-500">Operations desktop</div></div>
+      </div>
+      <div className="px-3 pb-2 text-[10px] font-semibold uppercase tracking-[.15em] text-slate-500">Workspace</div>
+      <nav className="space-y-1">
+        {navItems.map(({ id, label, icon: Icon }) => <button key={id} onClick={() => setView(id)} data-active={view === id} className="sidebar-link flex h-10 w-full items-center gap-3 rounded-lg px-3 text-left text-[13px] transition-colors"><Icon className="size-[17px]" />{label}</button>)}
+      </nav>
+      <div className="mt-auto">
+        <Separator className="mb-4" />
+        <div className="rounded-xl border border-slate-200 bg-white p-3.5">
+          <div className="flex items-center gap-2 text-xs font-medium text-slate-800"><span className="size-2 rounded-full bg-emerald-500 ring-4 ring-emerald-100" /> HERTA connected</div>
+          <p className="mt-2 truncate text-[11px] text-slate-500" title={session.baseUrl}>{session.baseUrl}</p>
+        </div>
+        <Button variant="ghost" className="mt-3 w-full justify-start text-slate-600 hover:bg-slate-100 hover:text-slate-900" onClick={signOut}><LogOut /> Sign out</Button>
+        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.2.0'}</div>
+      </div>
+    </aside>
+
+    <main className="min-w-0 flex-1">
+      <header className="window-drag flex h-[62px] items-center justify-between border-b bg-white/80 px-8">
+        <div className="text-xs text-muted-foreground">HERTA <span className="mx-2 text-slate-300">/</span><span className="font-medium text-foreground">{titleFor[view]}</span></div>
+        <div className="window-no-drag flex items-center gap-3">{headerAction}<div className="ml-1 flex size-8 items-center justify-center rounded-full bg-[#eaf0f5] text-xs font-semibold text-[#315273]">OP</div></div>
+      </header>
+
+      <div key={view} className="page-transition mx-auto max-w-[1320px] px-8 py-8">
+        {view === 'overview' && <>
+          <div className="mb-7 flex items-end justify-between"><div><p className="eyebrow">Workspace</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">Overview</h1><p className="mt-1 text-sm text-muted-foreground">Your HERTA data operations, in one place.</p></div><Badge variant="outline" className="gap-1.5 border-emerald-200 bg-emerald-50 px-3 py-1.5 text-emerald-700"><span className="size-1.5 rounded-full bg-emerald-500" /> Connected</Badge></div>
+          <div className="grid gap-4 md:grid-cols-3">{topMetric.map(({ label, value, icon: Icon, note }) => <Card key={label}><CardContent className="flex items-start justify-between p-5"><div><div className="text-sm text-muted-foreground">{label}</div><div className="mt-3 text-[28px] font-semibold tracking-tight">{value}</div><div className="mt-1 text-xs text-muted-foreground">{note}</div></div><div className="rounded-lg bg-[#edf3f8] p-2.5 text-[#315a80]"><Icon className="size-5" /></div></CardContent></Card>)}</div>
+          <div className="mt-6 grid gap-5 xl:grid-cols-[1.3fr_.8fr]">
+            <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Quick actions</CardTitle><CardDescription className="mt-1">Pick up where your work needs you.</CardDescription></div><Activity className="size-5 text-slate-400" /></CardHeader><CardContent className="grid gap-3 sm:grid-cols-2">
+              <ActionTile icon={Users} title="Browse subjects" description="Search and export HERTA records" onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} />
+              <ActionTile icon={Upload} title="Import NIST files" description="Preview files before sending" onClick={() => setView('import')} />
+              <ActionTile icon={Fingerprint} title="Check profiles" description="Review profile metadata safely" onClick={() => setView('profiles')} />
+              <ActionTile icon={ArrowDownToLine} title="Export records" description="Create a NIST archive and CSV" onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} />
+            </CardContent></Card>
+            <Card><CardHeader><CardTitle className="text-base">Connection</CardTitle><CardDescription>Your session is active for this desktop window.</CardDescription></CardHeader><CardContent className="space-y-4"><div className="flex items-center gap-3 rounded-lg border bg-slate-50/70 p-3.5"><div className="flex size-9 items-center justify-center rounded-lg bg-white text-[#315a80] shadow-sm"><Cloud className="size-[18px]" /></div><div className="min-w-0"><p className="text-xs font-medium">HERTA API</p><p className="mt-1 truncate text-xs text-muted-foreground">{session.baseUrl}</p></div><CheckCircle2 className="ml-auto size-4 shrink-0 text-emerald-600" /></div><div className="flex gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Credentials and the access token are held in memory for this session.</span></div><Separator /><div className="flex items-center justify-between text-xs"><span className="text-muted-foreground">Subject records</span><span className="font-medium">{serverCount.toLocaleString()} available</span></div></CardContent></Card>
+          </div>
+          <Card className="mt-5"><CardHeader className="pb-3"><CardTitle className="text-base">Recent subjects</CardTitle><CardDescription>Open a subject to inspect its HERTA fields and profile.</CardDescription></CardHeader><CardContent className="pt-0"><SubjectTable subjects={subjects.slice(0, 5)} onOpenDetails={showSubjectDetails} empty="Refresh to load subjects from HERTA." /></CardContent></Card>
+        </>}
+
+        {view === 'subjects' && <>
+          <PageHeading eyebrow="Records" title="Subjects" description="Search HERTA records by code or metadata, then open a subject to inspect its data." />
+          <Card><CardHeader className="gap-4 pb-4 sm:flex-row sm:items-center sm:justify-between"><div><CardTitle className="text-base">Subject directory</CardTitle><CardDescription className="mt-1">{serverCount.toLocaleString()} total records on this server · {selected.size} selected · Select a code to view its data</CardDescription></div><div className="relative w-full sm:max-w-[300px]"><Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={subjectQuery} onChange={(event) => setSubjectQuery(event.target.value)} placeholder="Search code or metadata..." className="pl-9" /></div></CardHeader>
+            <CardContent className="pt-0"><div className="mb-3 flex items-center gap-2"><Checkbox id="select-all" checked={selectedAll} onCheckedChange={(checked) => setSelected((current) => { const next = new Set(current); subjects.forEach(({ code }) => checked ? next.add(code) : next.delete(code)); return next; })} /><label htmlFor="select-all" className="cursor-pointer text-xs text-muted-foreground">Select visible subjects</label><Button variant="ghost" size="sm" className="ml-auto text-xs" onClick={() => loadSubjects(subjectQuery).catch(() => {})}><RefreshCw className={`mr-1 size-3.5 ${loading ? 'animate-spin' : ''}`} />Refresh</Button></div>
+              <SubjectTable subjects={subjects} selected={selected} onSelect={toggleSubject} onOpenDetails={showSubjectDetails} loading={loading} empty="No subjects match your search." /></CardContent></Card>
+        </>}
+
+        {view === 'import' && <>
+          <PageHeading eyebrow={restoreSource ? 'Recovery' : 'Data transfer'} title={restoreSource ? 'Restore snapshot' : 'NIST import'} description={restoreSource ? 'Review the selected backup files, then confirm the restore to HERTA.' : 'Select files, preview the batch, then confirm before sending it to HERTA.'} />
+          <div className="grid gap-5 xl:grid-cols-[1fr_310px]">
+            <div className="space-y-5">
+              <Card><CardHeader><CardTitle className="text-base">Select files</CardTitle><CardDescription>Choose one or more .nist files using the native file picker.</CardDescription></CardHeader><CardContent>
+                <button onClick={chooseFiles} className="flex min-h-[165px] w-full flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50/50 transition-colors hover:border-[#7f9ab6] hover:bg-[#f7fafc]"><div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><FolderOpen className="size-5" /></div><span className="text-sm font-medium">Choose NIST files</span><span className="mt-1 text-xs text-muted-foreground">Files stay on this computer until you run the import</span></button>
+                {!!files.length && <div className="mt-4 space-y-2">{files.map((file) => <div key={file.id} className="flex items-center gap-3 rounded-lg border px-3 py-2.5"><FileCheck2 className="size-4 shrink-0 text-[#6385a5]" /><div className="min-w-0 flex-1"><div className="truncate text-sm font-medium">{file.name}</div><div className="mt-0.5 text-xs text-muted-foreground">{formatSize(file.size)}</div></div><Button variant="ghost" size="icon" aria-label={`Remove ${file.name}`} onClick={() => setFiles((current) => current.filter((entry) => entry.id !== file.id))}><X className="size-4" /></Button></div>)}</div>}
+              </CardContent></Card>
+              {importRows.length > 0 && <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Import results</CardTitle><CardDescription className="mt-1">{importRows.length} file{importRows.length === 1 ? '' : 's'} · {importExecuted ? 'sent to HERTA' : 'preview only'}</CardDescription></div><Button variant="outline" size="sm" onClick={saveImportReport}><ArrowDownToLine /> Save report</Button></CardHeader><CardContent className="pt-0"><ImportTable rows={importRows} /></CardContent></Card>}
+            </div>
+            <Card className="h-fit"><CardHeader><CardTitle className="text-base">Import settings</CardTitle><CardDescription>Review the destination before sending.</CardDescription></CardHeader><CardContent className="space-y-4"><div><label htmlFor="group-id" className="mb-2 block text-xs font-medium">HERTA group ID</label><Input id="group-id" value={group} onChange={(event) => setGroup(event.target.value)} placeholder="0" /></div><Separator /><div className="flex items-start gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Import is not sent until you confirm by typing <strong className="font-semibold text-foreground">IMPORT</strong>.</span></div><Button variant="outline" className="w-full" disabled={!files.length || loading} onClick={previewImport}>{loading ? <LoaderCircle className="animate-spin" /> : <FileCheck2 />} Preview import</Button><Button className="w-full" disabled={!files.length || loading} onClick={() => { setConfirmText(''); setConfirmOpen(true); }}><Upload /> Send import to HERTA</Button></CardContent></Card>
+          </div>
+        </>}
+
+        {view === 'profiles' && <>
+          <PageHeading eyebrow="Data quality" title="Profile check" description="Inspect profile metadata without displaying or exporting profile contents." action={<Button onClick={runProfileCheck} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <RefreshCw />} Run profile check</Button>} />
+          <Card><CardHeader><CardTitle className="text-base">Profile metadata</CardTitle><CardDescription>{profiles.length ? `${profiles.length} profiles checked` : 'JSON and Base64-like indicators are calculated locally from the HERTA response.'}</CardDescription></CardHeader><CardContent className="pt-0">{profileError ? <InlineError text={profileError} /> : <Table><TableHeader><TableRow><TableHead>Subject code</TableHead><TableHead>Profile length</TableHead><TableHead>Format</TableHead><TableHead>Base64-like</TableHead></TableRow></TableHeader><TableBody>{profiles.length ? profiles.map((row) => <TableRow key={row.code}><TableCell className="mono font-medium">{row.code}</TableCell><TableCell>{Number(row.profile_length).toLocaleString()} chars</TableCell><TableCell><Badge variant={row.is_json ? 'secondary' : 'outline'}>{row.is_json ? 'JSON' : 'Other'}</Badge></TableCell><TableCell><Badge variant={row.is_base64_like ? 'secondary' : 'outline'}>{row.is_base64_like ? 'Likely' : 'No'}</Badge></TableCell></TableRow>) : <EmptyRow cols={4} text="Run a check to load profile metadata." />}</TableBody></Table>}</CardContent></Card>
+        </>}
+
+        {view === 'backups' && <>
+          <PageHeading eyebrow="Recovery" title="Backup & restore" description="Create a portable NIST snapshot or preview a previous snapshot before restoring it." />
+          <div className="grid gap-5 xl:grid-cols-[1fr_320px]">
+            <div className="space-y-5">
+              <Card><CardHeader><div className="mb-3 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><ArchiveRestore className="size-5" /></div><CardTitle className="text-base">Create a full snapshot</CardTitle><CardDescription>Export every HERTA subject as a NIST file into one ZIP archive.</CardDescription></CardHeader><CardContent className="space-y-4"><div className="rounded-lg border bg-slate-50/70 p-3.5 text-xs leading-5 text-muted-foreground"><div className="font-medium text-foreground">Snapshot includes</div><ul className="mt-2 space-y-1"><li>• NIST export for each subject</li><li>• CSV export result report</li><li>• Backup manifest with timestamp and app version</li></ul></div><Button onClick={createSnapshot} disabled={loading || !serverCount}>{loading ? <LoaderCircle className="animate-spin" /> : <ArrowDownToLine />} Save snapshot ZIP</Button><p className="text-xs text-muted-foreground">Limit: {500} subjects / 256 MiB per snapshot. Backup files contain sensitive biometric records; store them securely.</p></CardContent></Card>
+              <Card><CardHeader><div className="mb-3 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><History className="size-5" /></div><CardTitle className="text-base">Restore a snapshot</CardTitle><CardDescription>Load a HERTA snapshot ZIP, review its NIST files, then confirm before sending them back.</CardDescription></CardHeader><CardContent><Button variant="outline" onClick={restoreSnapshot} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <ArchiveRestore />} Choose snapshot ZIP</Button><p className="mt-3 text-xs text-muted-foreground">Restore sends NIST files through HERTA’s import API. Duplicate-record behavior depends on the HERTA server; review its policy before restoring.</p></CardContent></Card>
+            </div>
+            <Card className="h-fit"><CardHeader><CardTitle className="text-base">Snapshot status</CardTitle><CardDescription>Stored on this computer only after you choose a save location.</CardDescription></CardHeader><CardContent className="space-y-4"><div className="flex items-center justify-between rounded-lg border p-3"><span className="text-xs text-muted-foreground">Subjects on HERTA</span><span className="text-sm font-semibold">{serverCount.toLocaleString()}</span></div><div className="space-y-1"><div className="text-xs font-medium">Last snapshot</div><div className="text-xs text-muted-foreground">{lastSnapshot ? new Date(lastSnapshot.at).toLocaleString() : 'No snapshot recorded on this desktop yet.'}</div></div><Separator /><div className="flex gap-2 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>The audit log records snapshot counts and time. It never stores profiles, passwords, or access tokens.</span></div></CardContent></Card>
+          </div>
+        </>}
+
+        {view === 'health' && <>
+          <PageHeading eyebrow="Operations" title="System health" description="Check the HERTA API connected to this desktop session." />
+          <div className="grid gap-5 xl:grid-cols-[1fr_350px]">
+            <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">HERTA API</CardTitle><CardDescription className="mt-1">Read-only connectivity check against the subjects endpoint.</CardDescription></div>{health?.ok ? <Badge variant="secondary" className="bg-emerald-50 text-emerald-700"><span className="mr-1.5 size-1.5 rounded-full bg-emerald-500" />Healthy</Badge> : healthError ? <Badge variant="destructive">Unavailable</Badge> : <Badge variant="outline">Checking</Badge>}</CardHeader><CardContent>{healthError ? <InlineError text={healthError} /> : <div className="grid gap-3 sm:grid-cols-3"><HealthMetric label="API response" value={health ? `${health.latencyMs} ms` : '—'} /><HealthMetric label="Subject records" value={health ? health.subjectCount.toLocaleString() : '—'} /><HealthMetric label="Last check" value={health ? new Date(health.checkedAt).toLocaleTimeString() : 'Waiting'} /></div>}<div className="mt-4 rounded-lg border bg-slate-50/70 px-3 py-2.5 text-xs text-muted-foreground">{session.baseUrl}</div></CardContent></Card>
+            <Card><CardHeader><CardTitle className="text-base">Desktop capabilities</CardTitle><CardDescription>Functions this app can operate through the documented HERTA API.</CardDescription></CardHeader><CardContent className="space-y-3"><CapabilityRow label="HERTA REST API" status="Connected" /><CapabilityRow label="NIST file import/export" status="Available" /><CapabilityRow label="Local snapshot & restore" status="Available" /><CapabilityRow label="Local activity audit" status="Available" /></CardContent></Card>
+          </div>
+          <Card className="mt-5"><CardHeader><CardTitle className="text-base">Server-side platform services</CardTitle><CardDescription>These components run beside the HERTA server; the desktop app does not install or host them.</CardDescription></CardHeader><CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{['Database connectors', 'Debezium CDC', 'Kafka messaging', 'Redis cache', 'Elasticsearch', 'MinIO / S3 storage', 'Prometheus / Grafana', 'Keycloak / notifications'].map((item) => <div key={item} className="flex items-center gap-2 rounded-lg border bg-white px-3 py-2.5 text-xs text-muted-foreground"><Database className="size-4 text-slate-400" />{item}<Badge variant="outline" className="ml-auto shrink-0 text-[10px]">Server-side</Badge></div>)}</CardContent></Card>
+        </>}
+
+        {view === 'integrations' && <>
+          <PageHeading eyebrow="Sources" title="REST & Kafka integrations" description="Connect NIST sources, create topics in an existing Kafka cluster, or receive REST uploads into a reviewable import queue." />
+          {integrationMessage && <div role="status" className={`mb-5 rounded-lg border px-4 py-3 text-sm ${/failed|could not|invalid|must|error|limit|enter/i.test(integrationMessage) ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-sky-200 bg-sky-50 text-sky-900'}`}>{integrationMessage}</div>}
+          <div className="grid gap-5 xl:grid-cols-2">
+            <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Cloud className="size-5" /></div><CardTitle className="text-base">Connect a REST NIST source</CardTitle><CardDescription>Read from any JSON endpoint that returns Base64 NIST files.</CardDescription></CardHeader><CardContent className="space-y-3"><div><label className="mb-1.5 block text-xs font-medium">REST URL</label><Input value={restSource.url} onChange={(event) => setRestSource((current) => ({ ...current, url: event.target.value }))} placeholder="https://source.example/api/nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Bearer token <span className="font-normal text-muted-foreground">(optional; memory only)</span></label><Input type="password" autoComplete="off" value={restSource.bearerToken} onChange={(event) => setRestSource((current) => ({ ...current, bearerToken: event.target.value }))} placeholder="API token" /></div><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={restSource.verifyTls} onCheckedChange={(checked) => setRestSource((current) => ({ ...current, verifyTls: Boolean(checked) }))} /> Verify TLS certificate</label><div className="rounded-lg border bg-slate-50/70 p-3 text-xs leading-5 text-muted-foreground">Expected response: <code>{'{ "files": [{ "code": "SUB001", "fileContent": "BASE64_NIST" }] }'}</code>. Received files stay in memory until imported or discarded.</div><Button onClick={fetchRest} disabled={loading || !restSource.url.trim()}>{loading ? <LoaderCircle className="animate-spin" /> : <ArrowDownToLine />} Fetch NIST files</Button></CardContent></Card>
+
+            <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Radio className="size-5" /></div><CardTitle className="text-base">Kafka source</CardTitle><CardDescription>Connect to a Kafka cluster. Topic creation requires an existing, reachable broker.</CardDescription></CardHeader><CardContent className="space-y-3"><div><label className="mb-1.5 block text-xs font-medium">Bootstrap brokers</label><Input value={kafkaSource.brokers} onChange={(event) => setKafkaSource((current) => ({ ...current, brokers: event.target.value }))} placeholder="broker1:9092,broker2:9092" /></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">Topic</label><Input value={kafkaSource.topic} onChange={(event) => setKafkaSource((current) => ({ ...current, topic: event.target.value }))} placeholder="herta.nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Consumer group</label><Input value={kafkaSource.groupId} onChange={(event) => setKafkaSource((current) => ({ ...current, groupId: event.target.value }))} /></div></div><div><label className="mb-1.5 block text-xs font-medium">Message format</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={kafkaSource.messageFormat} onChange={(event) => setKafkaSource((current) => ({ ...current, messageFormat: event.target.value }))}><option value="json-base64">JSON with Base64 NIST fileContent</option><option value="raw-nist">Raw NIST bytes</option></select></div><div className="grid gap-3 sm:grid-cols-2"><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={kafkaSource.tls} onCheckedChange={(checked) => setKafkaSource((current) => ({ ...current, tls: Boolean(checked) }))} /> Use TLS</label><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={kafkaSource.verifyTls} onCheckedChange={(checked) => setKafkaSource((current) => ({ ...current, verifyTls: Boolean(checked) }))} /> Verify certificate</label></div><div className="grid gap-3 sm:grid-cols-3"><div className="sm:col-span-1"><label className="mb-1.5 block text-xs font-medium">SASL</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={kafkaSource.mechanism} onChange={(event) => setKafkaSource((current) => ({ ...current, mechanism: event.target.value }))}><option value="none">None</option><option value="plain">PLAIN</option><option value="scram-sha-256">SCRAM-256</option><option value="scram-sha-512">SCRAM-512</option></select></div><Input className="self-end" disabled={kafkaSource.mechanism === 'none'} value={kafkaSource.username} onChange={(event) => setKafkaSource((current) => ({ ...current, username: event.target.value }))} placeholder="SASL username" /><Input className="self-end" type="password" autoComplete="off" disabled={kafkaSource.mechanism === 'none'} value={kafkaSource.password} onChange={(event) => setKafkaSource((current) => ({ ...current, password: event.target.value }))} placeholder="SASL password" /></div><div className="flex flex-wrap gap-2"><Button variant="outline" onClick={checkKafka} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <HeartPulse />} Test broker</Button><Button variant="outline" onClick={createTopic} disabled={loading}><Plus /> Create topic</Button><Button onClick={toggleKafka} disabled={loading}>{kafkaListening ? <><Pause /> Pause receiving</> : <><Play /> Start receiving</>}</Button></div>{kafkaStatus && <div className="rounded-lg border bg-slate-50/70 p-3 text-xs text-muted-foreground">Connected · {kafkaStatus.brokers} broker(s) · topic {kafkaStatus.topicExists ? 'available' : 'not created yet'}</div>}<p className="text-[11px] leading-4 text-muted-foreground">Credentials are kept in app memory. Received messages are not committed until their NIST files import successfully. Use a dedicated topic and consumer group for this app.</p></CardContent></Card>
+
+            <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Server className="size-5" /></div><CardTitle className="text-base">Create a local REST receiver</CardTitle><CardDescription>Let a REST source push NIST files into this desktop app for review.</CardDescription></CardHeader><CardContent className="space-y-3">{receiver.running ? <><div className="rounded-lg border bg-slate-50/70 p-3 text-xs"><div className="font-medium">POST http://127.0.0.1:{receiver.port}/api/v1/nist</div><div className="mt-1 break-all text-muted-foreground">Authorization: Bearer {receiver.token}</div></div><div className="text-xs leading-5 text-muted-foreground">This listener accepts only connections from this computer. The token is temporary and clears when the app closes.</div><Button variant="outline" onClick={stopReceiver}><Pause /> Stop receiver</Button></> : <><div><label className="mb-1.5 block text-xs font-medium">Local port</label><Input type="number" min="1024" max="65535" value={receiver.port} onChange={(event) => setReceiver((current) => ({ ...current, port: event.target.value }))} /></div><div className="rounded-lg border bg-slate-50/70 p-3 text-xs leading-5 text-muted-foreground">POST JSON <code>{'{ "code": "SUB001", "fileContent": "BASE64_NIST" }'}</code> or raw NIST bytes with <code>Content-Type: application/octet-stream</code> and <code>X-File-Name</code>.</div><Button onClick={startReceiver} disabled={loading}><Play /> Start local receiver</Button></>}</CardContent></Card>
+
+            <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Received NIST inbox</CardTitle><CardDescription className="mt-1">{sourceInbox.length} item(s) waiting on this desktop</CardDescription></div><Button variant="outline" size="sm" onClick={refreshInbox}><RefreshCw /> Refresh</Button></CardHeader><CardContent className="space-y-3"><div className="max-h-[280px] space-y-2 overflow-auto">{sourceInbox.length ? sourceInbox.map((item) => <div key={item.id} className="flex items-center gap-3 rounded-lg border px-3 py-2.5">{item.error ? <CircleHelp className="size-4 shrink-0 text-amber-600" /> : <Checkbox checked={inboxSelection.has(item.id)} onCheckedChange={(checked) => setInboxSelection((current) => { const next = new Set(current); checked ? next.add(item.id) : next.delete(item.id); return next; })} />}<div className="min-w-0 flex-1"><div className="truncate text-xs font-medium">{item.name}</div><div className="mt-0.5 truncate text-[11px] text-muted-foreground">{item.source}{item.error ? ` · ${item.error}` : ` · ${formatSize(item.size)}`}</div></div>{item.error && <Button variant="ghost" size="sm" onClick={() => discardInboxItem(item.id)}>Discard</Button>}</div>) : <div className="rounded-lg border border-dashed py-8 text-center text-xs text-muted-foreground">No REST or Kafka messages received yet.</div>}</div><Button className="w-full" onClick={loadReceived} disabled={loading || inboxSelection.size === 0}><ArrowRight /> Review selected files in NIST import</Button></CardContent></Card>
+          </div>
+        </>}
+
+        {view === 'activity' && <>
+          <PageHeading eyebrow="Audit" title="Activity log" description="Local record of desktop sign-ins, NIST imports/exports, and snapshots." />
+          <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Recent activity</CardTitle><CardDescription className="mt-1">Last {auditEvents.length} events · stored locally on this desktop</CardDescription></div><Badge variant="outline">{auditEvents.length} / 500</Badge></CardHeader><CardContent className="pt-0"><Table><TableHeader><TableRow><TableHead>Time</TableHead><TableHead>Activity</TableHead><TableHead>Details</TableHead></TableRow></TableHeader><TableBody>{auditEvents.length ? auditEvents.map((event, index) => <TableRow key={`${event.at}-${index}`}><TableCell className="whitespace-nowrap text-xs text-muted-foreground">{new Date(event.at).toLocaleString()}</TableCell><TableCell><Badge variant="secondary">{event.action}</Badge></TableCell><TableCell className="text-sm text-muted-foreground">{event.summary}</TableCell></TableRow>) : <EmptyRow cols={3} text="No activity recorded on this desktop yet." />}</TableBody></Table></CardContent></Card>
+          <p className="mt-3 text-xs text-muted-foreground">The audit log omits biometric profile content, credentials, subject identifiers, and access tokens.</p>
+        </>}
+      </div>
+    </main>
+
+    <Dialog open={Boolean(subjectDetails)} onOpenChange={(open) => { if (!open) setSubjectDetails(null); }}><DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-[820px]"><DialogHeader><DialogTitle>Subject details {subjectDetails?.code && <span className="mono ml-2 text-sm font-normal text-muted-foreground">{subjectDetails.code}</span>}</DialogTitle><DialogDescription>Fields returned by HERTA for this subject. Biometric profile content is shown only when you reveal it.</DialogDescription></DialogHeader>{subjectDetailsLoading ? <div className="flex items-center gap-2 py-10 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />Loading subject data…</div> : subjectDetails?.error ? <InlineError text={subjectDetails.error} /> : subjectDetails && <div className="space-y-4"><div className="grid gap-3 sm:grid-cols-3"><HealthMetric label="Subject code" value={subjectDetails.code || '—'} /><HealthMetric label="Profile size" value={`${Number(subjectDetails.profileLength || 0).toLocaleString()} chars`} /><HealthMetric label="Other fields" value={Object.keys(subjectDetails.fields || {}).length.toLocaleString()} /></div><Card><CardHeader className="pb-3"><CardTitle className="text-sm">Subject fields</CardTitle><CardDescription>Values returned in the HERTA subject record.</CardDescription></CardHeader><CardContent className="grid gap-2 sm:grid-cols-2">{Object.entries(subjectDetails.fields || {}).map(([key, value]) => <div key={key} className="min-w-0 rounded-lg border bg-slate-50/60 p-3"><div className="text-[11px] font-medium text-muted-foreground">{key}</div><pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-sans text-xs text-foreground">{formatFieldValue(value)}</pre></div>)}</CardContent></Card><Card><CardHeader className="flex-row items-center justify-between gap-3 space-y-0"><div><CardTitle className="text-sm">Biometric profile</CardTitle><CardDescription className="mt-1">{subjectDetails.profileLength.toLocaleString()} characters · treat as sensitive data.</CardDescription></div><Button variant="outline" size="sm" disabled={!subjectDetails.profileText} onClick={() => setProfileRevealed((shown) => !shown)}>{profileRevealed ? 'Hide profile' : 'Reveal profile'}</Button></CardHeader>{profileRevealed && <CardContent className="pt-0"><pre className="max-h-[360px] overflow-auto rounded-lg border bg-slate-950 p-4 text-[11px] leading-5 text-slate-100">{subjectDetails.profileJson ? JSON.stringify(subjectDetails.profileJson, null, 2) : subjectDetails.profileText || '(empty)'}</pre>{subjectDetails.profileTruncated && <p className="mt-2 text-xs text-amber-700">Profile display is limited to the first 512 KiB.</p>}</CardContent>}</Card></div>}</DialogContent></Dialog>
+    <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}><DialogContent><DialogHeader><DialogTitle>{restoreSource ? 'Confirm snapshot restore' : 'Confirm NIST import'}</DialogTitle><DialogDescription>This sends {files.length} file{files.length === 1 ? '' : 's'} to {session.baseUrl} in group {group || '0'}. HERTA controls how duplicate records are handled.</DialogDescription></DialogHeader><div className="py-2"><label htmlFor="confirm-import-input" className="mb-2 block text-sm font-medium">Type IMPORT to continue</label><Input id="confirm-import-input" autoComplete="off" value={confirmText} onChange={(event) => setConfirmText(event.target.value)} placeholder="IMPORT" /></div><DialogFooter><Button variant="outline" onClick={() => setConfirmOpen(false)}>Cancel</Button><Button disabled={confirmText !== 'IMPORT' || loading} onClick={runImport}>{loading && <LoaderCircle className="animate-spin" />} {restoreSource ? 'Restore snapshot' : 'Confirm import'}</Button></DialogFooter></DialogContent></Dialog>
+    {toast && <div role="status" className={`fixed bottom-5 right-5 z-[100] flex max-w-[430px] items-center gap-2.5 rounded-xl border bg-white px-4 py-3 text-sm shadow-lg ${toast.error ? 'border-red-200 text-red-700' : 'border-emerald-200 text-slate-700'}`}>{toast.error ? <CircleHelp className="size-4 shrink-0 text-red-500" /> : <CheckCircle2 className="size-4 shrink-0 text-emerald-600" />}{toast.message}</div>}
+  </div>;
+}
+
+function Login({ config, setConfig, notice, loading, onSubmit }) {
+  return <div className="flex min-h-screen items-stretch bg-white">
+    <section className="hidden w-[48%] flex-col justify-between border-r border-slate-200 bg-[#f3f6f9] px-12 py-10 text-slate-800 lg:flex">
+      <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><Fingerprint className="size-6" /></div><div><div className="font-semibold tracking-wide">HERTA</div><div className="text-[11px] text-slate-500">Operations desktop</div></div></div>
+      <div className="max-w-[500px] pb-6"><div className="mb-6 flex size-12 items-center justify-center rounded-2xl border border-slate-200 bg-white"><Database className="size-6 text-[#53799f]" /></div><div className="text-[34px] font-semibold leading-[1.17] tracking-tight">Biometric operations, <span className="text-[#53799f]">thoughtfully connected.</span></div><p className="mt-5 max-w-[420px] text-sm leading-6 text-slate-600">A secure desktop workspace for HERTA subject records, NIST file operations, and profile metadata checks.</p><div className="mt-9 grid grid-cols-3 gap-3"><Feature icon={Users} label="Subjects" /><Feature icon={FileArchive} label="NIST files" /><Feature icon={ShieldCheck} label="Local session" /></div></div>
+      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.2.0'}</div>
+    </section>
+    <section className="flex flex-1 items-center justify-center px-6 py-10">
+      <div className="w-full max-w-[410px]">
+        <div className="mb-8 flex items-center gap-3 lg:hidden"><div className="flex size-10 items-center justify-center rounded-xl bg-[#eaf1f7] text-[#315a80]"><Fingerprint className="size-6" /></div><div><div className="font-semibold">HERTA</div><div className="text-[11px] text-muted-foreground">Operations desktop</div></div></div>
+        <p className="eyebrow">Welcome back</p><h1 className="mt-2 text-[28px] font-semibold tracking-tight">Sign in to HERTA</h1><p className="mt-2 text-sm text-muted-foreground">Connect to your HERTA server to continue.</p>
+        <form onSubmit={onSubmit} className="mt-8 space-y-5">
+          <div><label htmlFor="base-url" className="mb-2 block text-sm font-medium">HERTA server URL</label><Input id="base-url" name="base_url" type="url" required value={config.baseUrl} onChange={(event) => setConfig((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="https://localhost:8005" /><p className="mt-1.5 text-xs text-muted-foreground">Use the API address for your HERTA installation.</p></div>
+          <div><label htmlFor="username" className="mb-2 block text-sm font-medium">Username</label><Input id="username" name="username" autoComplete="username" required defaultValue="admin" placeholder="Your HERTA username" /></div>
+          <div><label htmlFor="password" className="mb-2 block text-sm font-medium">Password</label><Input id="password" name="password" type="password" autoComplete="current-password" required placeholder="Your password" /></div>
+          <div className="rounded-xl border bg-slate-50/60 p-3.5"><label className="flex cursor-pointer items-start gap-3"><Checkbox checked={config.verifyTls} onCheckedChange={(checked) => setConfig((current) => ({ ...current, verifyTls: Boolean(checked) }))} className="mt-0.5" /><span><span className="block text-xs font-medium">Verify server certificate</span><span className="mt-1 block text-[11px] leading-4 text-muted-foreground">Leave off for a trusted HERTA server using a private or self-signed certificate.</span></span></label></div>
+          {notice && <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs leading-5 text-red-800">{notice}{notice.includes('TLS certificate') && config.verifyTls && <span className="mt-1 block font-medium">Uncheck “Verify server certificate” and try again if this is your trusted local HERTA.</span>}</div>}
+          <Button type="submit" className="h-10 w-full" disabled={loading}>{loading ? <><LoaderCircle className="animate-spin" /> Connecting...</> : <>Sign in <ArrowRight /></>}</Button>
+        </form>
+        <div className="mt-6 flex items-start gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Your password and access token stay in memory and are cleared when you sign out or close the app.</span></div>
+      </div>
+    </section>
+  </div>;
+}
+
+function PageHeading({ eyebrow, title, description, action }) { return <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">{eyebrow}</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{description}</p></div>{action}</div>; }
+function ActionTile({ icon: Icon, title, description, onClick }) { return <button onClick={onClick} className="group flex items-center gap-3 rounded-xl border p-4 text-left transition-colors hover:border-[#c6d6e5] hover:bg-[#f8fafc]"><div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-[#edf3f8] text-[#315a80]"><Icon className="size-[18px]" /></div><div className="min-w-0 flex-1"><div className="text-sm font-medium">{title}</div><div className="mt-1 text-xs text-muted-foreground">{description}</div></div><ArrowRight className="size-4 text-slate-300 transition-transform group-hover:translate-x-0.5 group-hover:text-[#315a80]" /></button>; }
+function Feature({ icon: Icon, label }) { return <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm"><Icon className="size-4 text-[#53799f]" /><div className="mt-2 text-[11px] text-slate-600">{label}</div></div>; }
+function HealthMetric({ label, value }) { return <div className="rounded-lg border bg-white p-3.5"><div className="text-xs text-muted-foreground">{label}</div><div className="mt-2 truncate text-base font-semibold">{value}</div></div>; }
+function CapabilityRow({ label, status }) { return <div className="flex items-center justify-between gap-3 border-b pb-2.5 last:border-0 last:pb-0"><span className="text-xs">{label}</span><Badge variant="secondary" className="shrink-0 bg-emerald-50 text-emerald-700">{status}</Badge></div>; }
+function formatFieldValue(value) {
+  if (value == null) return '—';
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
+function SubjectTable({ subjects, selected, onSelect, onOpenDetails, loading, empty }) {
+  const columns = (onSelect ? 1 : 0) + 5;
+  return <Table><TableHeader><TableRow>{onSelect && <TableHead className="w-10" />}<TableHead>Subject</TableHead><TableHead>Profile size</TableHead><TableHead>Record fields</TableHead><TableHead>Status</TableHead><TableHead className="w-24">Details</TableHead></TableRow></TableHeader><TableBody>{subjects?.length ? subjects.map((subject) => <TableRow key={subject.code}>{onSelect && <TableCell><Checkbox checked={selected?.has(subject.code) || false} onCheckedChange={(checked) => onSelect(subject.code, Boolean(checked))} aria-label={`Select ${subject.code}`} /></TableCell>}<TableCell><button className="mono font-medium text-[#315a80] hover:underline" onClick={() => onOpenDetails?.(subject.code)}>{subject.code || '(no code)'}</button><div className="mt-1 max-w-[380px] truncate text-[11px] text-muted-foreground">{Object.keys(subject.metadata || {}).filter((key) => key !== 'code').slice(0, 2).map((key) => `${key}: ${subject.metadata[key]}`).join(' · ') || 'HERTA record'}</div></TableCell><TableCell className="text-muted-foreground">{subject.profile_length ? `${Number(subject.profile_length).toLocaleString()} chars` : '—'}</TableCell><TableCell>{Number(subject.field_count || 0).toLocaleString()}</TableCell><TableCell><Badge variant="secondary" className="gap-1 bg-emerald-50 text-emerald-700"><span className="size-1.5 rounded-full bg-emerald-500" /> Available</Badge></TableCell><TableCell><Button variant="ghost" size="sm" onClick={() => onOpenDetails?.(subject.code)}><Eye /> View</Button></TableCell></TableRow>) : <EmptyRow cols={columns} text={loading ? 'Loading subjects from HERTA...' : empty} />}</TableBody></Table>;
+}
+function ImportTable({ rows }) { return <Table><TableHeader><TableRow><TableHead>File</TableHead><TableHead>Code</TableHead><TableHead>Status</TableHead><TableHead>Size</TableHead><TableHead>Message</TableHead></TableRow></TableHeader><TableBody>{rows.map((row, index) => <TableRow key={`${row.File}-${index}`}><TableCell className="max-w-[200px] truncate font-medium">{row.File}</TableCell><TableCell className="mono">{row.Code}</TableCell><TableCell><Badge variant={['Failed', 'Rejected', 'HTTP_ERROR'].includes(row.Status) ? 'destructive' : row.Status === 'DryRun' ? 'outline' : 'secondary'}>{row.Status}</Badge></TableCell><TableCell>{formatSize(Number(row.Bytes) || 0)}</TableCell><TableCell className="max-w-[240px] text-xs text-muted-foreground">{row.Message}</TableCell></TableRow>)}</TableBody></Table>; }
+function EmptyRow({ cols, text }) { return <TableRow><TableCell colSpan={cols} className="h-28 text-center text-sm text-muted-foreground">{text}</TableCell></TableRow>; }
+function InlineError({ text }) { return <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800">{text}</div>; }

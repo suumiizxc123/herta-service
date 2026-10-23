@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f6fa">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>HERTA Operations</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="electron-overrides.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#home" aria-label="HERTA Operations home"><span class="brand-mark">H</span><span>HERTA<span class="brand-light"> / OPERATIONS</span></span></a>
+      <div class="sidebar-label">WORKSPACE</div>
+      <nav class="nav-list" aria-label="Main navigation">
+        <button class="nav-item active" data-view="overview"><span class="nav-icon">◫</span> Overview</button>
+        <button class="nav-item" data-view="subjects"><span class="nav-icon">◎</span> Subjects</button>
+        <button class="nav-item" data-view="import"><span class="nav-icon">↑</span> Import NIST</button>
+        <button class="nav-item" data-view="profiles"><span class="nav-icon">⌁</span> Profile check</button>
+      </nav>
+      <div class="sidebar-bottom"><span class="status-dot" id="connection-dot"></span><div><strong id="connection-label">Checking connection</strong><small id="connection-host">HERTA API</small></div></div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar"><div class="breadcrumbs"><span>HERTA</span><span class="crumb-sep">/</span><strong id="crumb">Overview</strong></div><div class="top-actions"><span class="secure-label"><span class="lock-icon">▣</span> Private session</span><button class="avatar" id="logout" title="Sign out" aria-label="Sign out">↗</button></div></header>
+      <section class="content">
+        <div id="notice" class="notice hidden" role="status"></div>
+        <section id="login-view" class="login-wrap hidden">
+          <div class="login-card"><div class="login-eyebrow"><span class="status-dot"></span> SECURE CONNECTION</div><h1>Connect to HERTA</h1><p class="muted">Sign in with your HERTA account to manage subject records.</p>
+            <form id="login-form">
+              <label>HERTA server URL<input id="base-url" name="base_url" required placeholder="https://localhost:8005" autocomplete="url"></label>
+              <label>Username<input name="username" required autocomplete="username" placeholder="HERTA username"></label>
+              <label>Password<input name="password" type="password" required autocomplete="current-password" placeholder="HERTA password"></label>
+              <label class="tls-option"><input id="verify-tls" type="checkbox"> Verify server TLS certificate</label>
+              <button class="button primary full" type="submit">Sign in <span>→</span></button>
+            </form><div class="login-foot"><span class="lock-icon">▣</span> Your password is used for sign-in and discarded. The access token stays in memory until you sign out or close the app.</div>
+          </div><div class="login-aside"><div class="hero-art"><div class="orbit orbit-a"></div><div class="orbit orbit-b"></div><div class="hero-core">H</div><span class="node node-a"></span><span class="node node-b"></span><span class="node node-c"></span></div><div class="aside-copy"><span class="eyebrow">BIOMETRIC DATA OPERATIONS</span><h2>One clear view<br>of your HERTA data.</h2><p>Browse subjects, move NIST files, and review profile health from a single workspace.</p></div></div>
+        </section>
+
+        <section id="overview-view" class="view hidden">
+          <div class="page-heading"><div><div class="eyebrow">OPERATIONS CENTER</div><h1>Good to see you.</h1><p>Manage HERTA subjects and biometric file transfers.</p></div><button class="button primary" data-action="refresh">↻ <span>Refresh data</span></button></div>
+          <div class="metric-grid"><article class="metric-card"><div class="metric-top"><span>Total subjects</span><span class="metric-icon blue">◎</span></div><div class="metric-value" id="metric-subjects">—</div><div class="metric-foot"><span class="metric-label">REGISTERED IN HERTA</span><span class="metric-arrow">↗</span></div></article><article class="metric-card"><div class="metric-top"><span>Connection</span><span class="metric-icon green">⌁</span></div><div class="metric-value metric-text" id="metric-status">Connected</div><div class="metric-foot"><span class="metric-label">API STATUS</span><span class="pill green-pill">● Online</span></div></article><article class="metric-card"><div class="metric-top"><span>Available tools</span><span class="metric-icon violet">✣</span></div><div class="metric-value">3</div><div class="metric-foot"><span class="metric-label">EXPORT · IMPORT · CHECK</span><span class="metric-arrow">↗</span></div></article></div>
+          <div class="section-title"><div><h2>Quick actions</h2><p>Start a common HERTA workflow.</p></div></div>
+          <div class="action-grid"><button class="action-card" data-view="subjects"><span class="action-icon blue">◎</span><span class="action-copy"><strong>Browse subjects</strong><small>Search and export records</small></span><span class="action-arrow">→</span></button><button class="action-card" data-view="import"><span class="action-icon orange">↑</span><span class="action-copy"><strong>Import NIST files</strong><small>Preview files before sending</small></span><span class="action-arrow">→</span></button><button class="action-card" data-view="profiles"><span class="action-icon violet">⌁</span><span class="action-copy"><strong>Check profiles</strong><small>Review format metadata only</small></span><span class="action-arrow">→</span></button></div>
+          <div class="info-banner"><div class="info-icon">i</div><div><strong>Biometric data stays in your control</strong><p>Exports download to your browser. Imports show a dry run first and require an explicit confirmation before sending files to HERTA.</p></div></div>
+        </section>
+
+        <section id="subjects-view" class="view hidden">
+          <div class="page-heading"><div><div class="eyebrow">HERTA DIRECTORY</div><h1>Subjects</h1><p>Search records and export NIST files.</p></div><button class="button primary" id="export-selected">↓ <span>Export selected</span></button></div>
+          <div class="toolbar"><div class="search-box"><span>⌕</span><input id="subject-search" type="search" placeholder="Search by subject code…" aria-label="Search subjects"></div><div class="toolbar-right"><span id="selected-count">0 selected</span><button class="button subtle" id="select-visible">Select visible</button><button class="button subtle" data-action="subjects">↻</button></div></div>
+          <div class="table-card"><div class="table-wrap"><table><thead><tr><th class="check-col"><input id="select-all" type="checkbox" aria-label="Select all visible subjects"></th><th>SUBJECT CODE</th><th>PROFILE SIZE</th><th>STATUS</th><th></th></tr></thead><tbody id="subjects-body"><tr><td colspan="5" class="empty-cell">Connect to HERTA to load subjects.</td></tr></tbody></table></div><div class="table-footer"><span id="subject-count">— subjects</span><span>Subject profile contents are hidden</span></div></div>
+        </section>
+
+        <section id="import-view" class="view hidden">
+          <div class="page-heading"><div><div class="eyebrow">BIOCOM TRANSFER</div><h1>Import NIST files</h1><p>Review selected files, then send them to HERTA.</p></div></div>
+          <div class="import-layout"><div class="table-card import-card"><div class="card-heading"><div><h2>Choose files</h2><p>Only <code>.nist</code> files · 32 MiB each · 256 MiB per batch</p></div><span class="file-count" id="file-count">0 files</span></div><div class="dropzone" id="dropzone"><span class="upload-icon">↑</span><strong>Choose NIST files from your computer</strong><small>Use the native file picker to add files</small><button class="button subtle browse-files" id="choose-files">Browse NIST files</button><small class="file-limit">Up to 500 files per batch</small></div><div id="file-list" class="file-list"><div class="empty-upload">No files selected</div></div><div class="import-options"><label>Group ID<input id="group-id" value="0" inputmode="numeric"></label><div class="button-row"><button class="button subtle" id="dry-run" disabled>Preview import</button><button class="button primary" id="run-import" disabled>Import files <span>→</span></button></div></div></div><aside class="side-note"><div class="note-icon orange">!</div><h3>Import carefully</h3><p>NIST files contain sensitive biometric information. Confirm the HERTA server and destination group before importing.</p><div class="note-rule"></div><ul><li>Preview checks file names and sizes only</li><li>Import sends files to the configured server</li><li>Successful HTTP responses still need verification in HERTA</li></ul></aside></div>
+          <div id="import-results" class="table-card result-card hidden"><div class="card-heading"><div><h2>Import report</h2><p id="import-summary"></p></div><button class="button subtle" id="download-import-report">↓ Download CSV</button></div><div class="table-wrap"><table><thead><tr><th>FILE</th><th>SUBJECT CODE</th><th>STATUS</th><th>SIZE</th><th>DETAILS</th></tr></thead><tbody id="import-body"></tbody></table></div></div>
+        </section>
+
+        <section id="profiles-view" class="view hidden">
+          <div class="page-heading"><div><div class="eyebrow">DATA QUALITY</div><h1>Profile check</h1><p>Inspect profile shape without showing biometric contents.</p></div><button class="button primary" id="run-profile-check">⌁ <span>Run profile check</span></button></div>
+          <div class="info-banner"><div class="info-icon">i</div><div><strong>Privacy by design</strong><p>This check reports profile length and whether the value resembles JSON or Base64. It never displays profile data.</p></div></div>
+          <div class="table-card profile-table"><div class="table-wrap"><table><thead><tr><th>SUBJECT CODE</th><th>PROFILE LENGTH</th><th>JSON</th><th>BASE64-LIKE</th></tr></thead><tbody id="profiles-body"><tr><td colspan="4" class="empty-cell">Run a check to inspect profile metadata.</td></tr></tbody></table></div><div class="table-footer"><span id="profile-count">No check run</span><span>Metadata only</span></div></div>
+        </section>
+      </section>
+    </main>
+  </div>
+  <div id="confirm-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div class="modal-backdrop"></div><div class="modal-card"><button class="modal-close" id="modal-close" aria-label="Close">×</button><div class="modal-warning">!</div><div class="eyebrow">FINAL CONFIRMATION</div><h2 id="confirm-title">Send biometric data?</h2><p id="confirm-copy">This will send the selected NIST files to the configured HERTA server.</p><label>Type <strong>IMPORT</strong> to continue<input id="confirm-input" autocomplete="off" placeholder="IMPORT"></label><div class="modal-actions"><button class="button subtle" id="cancel-import">Cancel</button><button class="button danger" id="confirm-import" disabled>Confirm import</button></div></div></div>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>

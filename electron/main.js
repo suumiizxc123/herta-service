@@ -1,0 +1,784 @@
+const { app, BrowserWindow, dialog, ipcMain, Menu } = require('electron');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+const http = require('node:http');
+const https = require('node:https');
+const crypto = require('node:crypto');
+const { unzipSync } = require('fflate');
+const { Kafka, logLevel } = require('kafkajs');
+const { createZip, inspectBackupArchive } = require('./backup-archive');
+const { MAX_FILES, safeNistName, normalizeNistSourcePayload } = require('./source-files');
+
+const APP_PAGE = path.resolve(__dirname, '../dist/renderer/index.html');
+const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
+const APP_URL = DEV_SERVER_URL || pathToFileURL(APP_PAGE).href;
+const MAX_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_BATCH_BYTES = 256 * 1024 * 1024;
+const MAX_EXPORT_BYTES = 256 * 1024 * 1024;
+const MAX_FILE_COUNT = 500;
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_BACKUP_BYTES = 256 * 1024 * 1024;
+const MAX_AUDIT_EVENTS = 500;
+const SUBJECT_PAGE_SIZE = 50;
+const sourceInbox = new Map();
+
+let mainWindow;
+let hertaSession = null;
+const selectedFiles = new Map();
+let auditCache;
+let subjectCache = [];
+let kafkaConsumer = null;
+let kafkaCurrent = null;
+let restReceiver = null;
+
+async function readAuditEvents() {
+  if (auditCache) return auditCache;
+  try {
+    const text = await fs.readFile(path.join(app.getPath('userData'), 'activity-log.json'), 'utf8');
+    const parsed = JSON.parse(text);
+    auditCache = Array.isArray(parsed) ? parsed.slice(0, MAX_AUDIT_EVENTS) : [];
+  } catch { auditCache = []; }
+  return auditCache;
+}
+
+async function recordActivity(action, summary) {
+  try {
+    const previous = await readAuditEvents();
+    const next = [{ at: new Date().toISOString(), action, summary }, ...previous].slice(0, MAX_AUDIT_EVENTS);
+    const folder = app.getPath('userData');
+    const destination = path.join(folder, 'activity-log.json');
+    const temporary = `${destination}.tmp`;
+    await fs.mkdir(folder, { recursive: true });
+    await fs.writeFile(temporary, JSON.stringify(next, null, 2), 'utf8');
+    await fs.rename(temporary, destination);
+    auditCache = next;
+  } catch { /* An audit disk error must not interrupt HERTA operations. */ }
+}
+
+function assertTrusted(event) {
+  if (!mainWindow || event.sender !== mainWindow.webContents || !event.senderFrame?.url.startsWith(APP_URL)) {
+    throw new Error('This action is available only from the HERTA desktop window.');
+  }
+}
+
+function assertSignedIn() {
+  if (!hertaSession?.token) throw new Error('Sign in to HERTA to continue.');
+  return hertaSession;
+}
+
+function normalizeBaseUrl(value) {
+  let target;
+  try { target = new URL(String(value || '').trim()); }
+  catch { throw new Error('Enter a valid HERTA server URL.'); }
+  if (!['http:', 'https:'].includes(target.protocol) || !target.hostname || target.username || target.password || target.search || target.hash) {
+    throw new Error('Use an http:// or https:// HERTA URL without credentials, query, or fragment.');
+  }
+  return target.toString().replace(/\/$/, '');
+}
+
+function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json } = {}) {
+  const target = new URL(pathname, `${baseUrl}/`);
+  const payload = json === undefined ? null : Buffer.from(JSON.stringify(json), 'utf8');
+  const headers = { Accept: 'application/json', 'Accept-Language': 'en' };
+  if (payload) {
+    headers['Content-Type'] = 'application/json';
+    headers['Content-Length'] = payload.length;
+  }
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const transport = target.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const request = transport.request(target, {
+      method,
+      headers,
+      rejectUnauthorized: target.protocol !== 'https:' || verifyTls,
+      timeout: 45_000,
+    }, (response) => {
+      const chunks = [];
+      let size = 0;
+      response.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) {
+          request.destroy(new Error('HERTA response exceeded the 64 MiB limit.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let data = {};
+        try { data = text ? JSON.parse(text) : {}; }
+        catch { return reject(new Error(`HERTA returned an unreadable response (HTTP ${response.statusCode}).`)); }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          const detail = [data.detail, data.message, data.error_description, data.error]
+            .find((value) => typeof value === 'string' && value.trim());
+          const safeDetail = detail ? ` ${detail.trim().slice(0, 400)}` : '';
+          const error = response.statusCode === 401 || response.statusCode === 403
+            ? new Error(`HERTA rejected the sign-in (HTTP ${response.statusCode}). Check the username and password.${safeDetail}`)
+            : new Error(`HERTA request failed (HTTP ${response.statusCode}).${safeDetail}`);
+          error.status = response.statusCode;
+          return reject(error);
+        }
+        resolve(data);
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('The HERTA request timed out.')));
+    request.on('error', (error) => {
+      if (['CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID'].includes(error.code)) {
+        reject(new Error('HERTA TLS certificate could not be verified. Enable the self-signed certificate option only for a trusted HERTA server.'));
+      } else {
+        reject(new Error(`Could not reach HERTA: ${error.message}`));
+      }
+    });
+    if (payload) request.write(payload);
+    request.end();
+  });
+}
+
+function authorizedJson(pathname, options = {}) {
+  const session = assertSignedIn();
+  return requestJson(session.baseUrl, session.verifyTls, pathname, { ...options, token: session.token }).catch((error) => {
+    if (error.status === 401 || error.status === 403) hertaSession = null;
+    throw error;
+  });
+}
+
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function toCsv(rows, columns) {
+  return `\uFEFF${[columns.join(','), ...rows.map((row) => columns.map((column) => csvEscape(row[column])).join(','))].join('\r\n')}`;
+}
+
+function safeFilename(value) {
+  return String(value).replace(/[^\p{L}\p{N}_.-]/gu, '_').slice(0, 100) || 'subject';
+}
+
+function profileToText(profile) {
+  if (profile == null) return '';
+  if (typeof profile === 'string') return profile;
+  try { return JSON.stringify(profile); } catch { return String(profile); }
+}
+
+async function getAllSubjects() {
+  const subjects = [];
+  let offset = 0;
+  let total = Infinity;
+  while (offset < total) {
+    const page = await authorizedJson(`/api/v1/subjects?offset=${offset}&size=${SUBJECT_PAGE_SIZE}`);
+    if (!Array.isArray(page.subjects)) throw new Error('HERTA returned an unexpected subjects list.');
+    subjects.push(...page.subjects.filter((subject) => subject && typeof subject === 'object'));
+    const pageSize = page.subjects.length;
+    total = Number.isFinite(Number(page.count)) ? Number(page.count) : offset + pageSize;
+    offset += pageSize;
+    if (!pageSize) break;
+  }
+  subjectCache = subjects;
+  return subjects;
+}
+
+function summarizeSubject(subject) {
+  const metadata = {};
+  for (const [key, value] of Object.entries(subject)) {
+    if (key === 'profile' || value == null || typeof value === 'object') continue;
+    metadata[key] = String(value).slice(0, 160);
+  }
+  const profile = profileToText(subject.profile);
+  return {
+    code: String(subject.code || ''),
+    profile_length: profile.length,
+    field_count: Object.keys(subject).length,
+    metadata,
+  };
+}
+
+async function getSubjectDetails(code) {
+  assertSignedIn();
+  const subjects = subjectCache.length ? subjectCache : await getAllSubjects();
+  const subject = subjects.find((item) => String(item.code || '') === String(code));
+  if (!subject) throw new Error('Subject was not found. Refresh the HERTA subject list and try again.');
+  const profile = profileToText(subject.profile);
+  let profileJson = null;
+  try { profileJson = profile ? JSON.parse(profile) : null; } catch { /* Non-JSON profile content remains available as text. */ }
+  const fields = Object.fromEntries(Object.entries(subject).filter(([key]) => key !== 'profile'));
+  let profileText = profile;
+  let profileTruncated = false;
+  if (profileText.length > 512 * 1024) {
+    profileText = profileText.slice(0, 512 * 1024);
+    profileTruncated = true;
+  }
+  return { code: String(subject.code || ''), fields, profileText, profileJson, profileLength: profile.length, profileTruncated };
+}
+
+async function profileCheck() {
+  const subjects = await getAllSubjects();
+  const results = subjects.map((subject) => {
+    const profile = profileToText(subject.profile);
+    let isJson = false;
+    try { JSON.parse(profile); isJson = Boolean(profile.trim()); } catch { /* Return metadata only. */ }
+    return {
+      code: String(subject.code || ''),
+      profile_length: profile.length,
+      is_json: isJson,
+      is_base64_like: Boolean(profile) && /^[A-Za-z0-9+/=\r\n]+$/.test(profile),
+    };
+  });
+  await recordActivity('Profile check', `${results.length} subject profiles checked; metadata only.`);
+  return results;
+}
+
+async function exportSubjects(codes, { backup = false } = {}) {
+  assertSignedIn();
+  if (!Array.isArray(codes) || !codes.length) throw new Error('Select at least one subject to export.');
+  if (codes.length > MAX_FILE_COUNT) throw new Error(`Export up to ${MAX_FILE_COUNT} subjects at a time.`);
+  const rows = [];
+  const files = [];
+  const names = new Set();
+  let totalBytes = 0;
+  for (const code of [...new Set(codes.map((value) => String(value).trim()).filter(Boolean))]) {
+    try {
+      const response = await authorizedJson(`/api/v1/subjects/${encodeURIComponent(code)}/export`, { method: 'POST', json: { format: 'nist' } });
+      const encoded = String(response.fileContent || '').replace(/\s+/g, '');
+      if (!encoded || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new Error('HERTA returned an invalid NIST payload.');
+      const data = Buffer.from(encoded, 'base64');
+      if (!data.length) throw new Error('HERTA returned an empty NIST file.');
+      if (totalBytes + data.length > MAX_EXPORT_BYTES) throw new Error('Export package exceeds the 256 MiB limit.');
+      const base = safeFilename(code);
+      let filename = `${base}.nist`;
+      let suffix = 2;
+      while (names.has(filename.toLowerCase())) filename = `${base}-${suffix++}.nist`;
+      names.add(filename.toLowerCase());
+      files.push({ name: filename, data });
+      totalBytes += data.length;
+      rows.push({ Code: code, Status: 'Success', Bytes: data.length, Details: filename });
+    } catch (error) {
+      rows.push({ Code: code, Status: 'Failed', Bytes: 0, Details: error.message });
+    }
+  }
+  files.push({ name: 'export-report.csv', data: toCsv(rows, ['Code', 'Status', 'Bytes', 'Details']) });
+  if (backup) {
+    files.push({ name: 'backup-manifest.json', data: Buffer.from(JSON.stringify({
+      application: 'HERTA Operations Desktop',
+      version: app.getVersion(),
+      createdAt: new Date().toISOString(),
+      subjectCount: codes.length,
+      successfulExports: rows.filter((row) => row.Status === 'Success').length,
+      format: 'NIST',
+    }, null, 2), 'utf8') });
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: backup ? 'Save HERTA snapshot backup' : 'Save HERTA NIST exports',
+    defaultPath: path.join(app.getPath('downloads'), backup ? `herta-snapshot-${stamp}.zip` : 'herta-exports.zip'),
+    filters: [{ name: 'ZIP archive', extensions: ['zip'] }],
+  });
+  if (result.canceled || !result.filePath) return { canceled: true, rows };
+  await fs.writeFile(result.filePath, createZip(files));
+  const succeeded = rows.filter((row) => row.Status === 'Success').length;
+  await recordActivity(backup ? 'Snapshot created' : 'NIST export', `${succeeded} of ${rows.length} subject files exported.`);
+  return { canceled: false, path: result.filePath, rows };
+}
+
+async function createBackup() {
+  const subjects = await getAllSubjects();
+  if (!subjects.length) throw new Error('HERTA has no subjects to include in a snapshot.');
+  if (subjects.length > MAX_FILE_COUNT) {
+    throw new Error(`This desktop snapshot supports up to ${MAX_FILE_COUNT} subjects per ZIP. HERTA currently has ${subjects.length}.`);
+  }
+  return exportSubjects(subjects.map((subject) => String(subject.code || '')).filter(Boolean), { backup: true });
+}
+
+async function checkHertaHealth() {
+  const started = Date.now();
+  const page = await authorizedJson('/api/v1/subjects?offset=0&size=1');
+  if (!Array.isArray(page.subjects)) throw new Error('HERTA health check returned an unexpected response.');
+  return { ok: true, latencyMs: Date.now() - started, subjectCount: Number(page.count) || 0, checkedAt: new Date().toISOString() };
+}
+
+function normalizeSourceUrl(value) {
+  let target;
+  try { target = new URL(String(value || '').trim()); }
+  catch { throw new Error('Enter a complete REST URL, including http:// or https://.'); }
+  if (!['http:', 'https:'].includes(target.protocol) || !target.hostname || target.username || target.password) {
+    throw new Error('REST source must use http:// or https:// and cannot include URL credentials.');
+  }
+  return target.toString();
+}
+
+function addSourceFiles(files, source, kafka = null) {
+  if (files.length + sourceInbox.size > MAX_FILE_COUNT) throw new Error(`The desktop inbox supports at most ${MAX_FILE_COUNT} files.`);
+  let total = [...sourceInbox.values()].reduce((sum, file) => sum + (file.data?.length || 0), 0);
+  for (const file of files) {
+    if (file.data.length > MAX_FILE_BYTES || total + file.data.length > MAX_BATCH_BYTES) {
+      throw new Error('The desktop source inbox is limited to 32 MiB per file and 256 MiB total.');
+    }
+    total += file.data.length;
+  }
+  const ids = [];
+  for (const file of files) {
+    const id = crypto.randomUUID();
+    sourceInbox.set(id, { id, name: file.name, data: file.data, source, kafka });
+    ids.push(id);
+  }
+  return ids;
+}
+
+async function fetchRestSource({ url, bearerToken = '', verifyTls = true } = {}) {
+  const target = normalizeSourceUrl(url);
+  const response = await requestJson(target, Boolean(verifyTls), target, { token: String(bearerToken || '').trim() || undefined });
+  const files = normalizeNistSourcePayload(response);
+  const ids = addSourceFiles(files, 'REST source');
+  await recordActivity('REST source received', `${files.length} NIST files read from a configured REST endpoint.`);
+  return { files: ids.map((id) => inboxSummary(sourceInbox.get(id))), count: files.length };
+}
+
+function normalizeKafkaConfig(config = {}) {
+  const brokers = String(config.brokers || '').split(',').map((value) => value.trim()).filter(Boolean);
+  const topic = String(config.topic || '').trim();
+  const groupId = String(config.groupId || 'herta-operations-desktop').trim();
+  if (!brokers.length || brokers.length > 20 || brokers.some((broker) => !/^[^\s,:]+:\d{1,5}$/.test(broker))) {
+    throw new Error('Enter Kafka brokers as host:port, separated by commas.');
+  }
+  if (!topic || topic.length > 249 || /[\s,]/.test(topic)) throw new Error('Enter a valid Kafka topic name.');
+  if (!groupId || groupId.length > 255) throw new Error('Enter a valid consumer group ID.');
+  const mechanism = String(config.mechanism || 'none').toLowerCase();
+  const sasl = mechanism === 'none' ? undefined : {
+    mechanism,
+    username: String(config.username || ''),
+    password: String(config.password || ''),
+  };
+  if (sasl && (!sasl.username || !sasl.password || !['plain', 'scram-sha-256', 'scram-sha-512'].includes(mechanism))) {
+    throw new Error('Enter valid Kafka SASL credentials and choose PLAIN or SCRAM-SHA-256/512.');
+  }
+  return { brokers, topic, groupId, ssl: Boolean(config.tls) ? { rejectUnauthorized: Boolean(config.verifyTls) } : undefined, sasl, messageFormat: config.messageFormat === 'raw-nist' ? 'raw-nist' : 'json-base64' };
+}
+
+function createKafkaClient(config) {
+  return new Kafka({
+    clientId: 'herta-operations-desktop', brokers: config.brokers, ssl: config.ssl, sasl: config.sasl,
+    logLevel: logLevel.ERROR, connectionTimeout: 8000, requestTimeout: 15000,
+    retry: { initialRetryTime: 300, retries: 2 },
+  });
+}
+
+async function testKafkaConnection(input) {
+  const config = normalizeKafkaConfig(input);
+  const admin = createKafkaClient(config).admin();
+  try {
+    await admin.connect();
+    const cluster = await admin.describeCluster();
+    let topicExists = false;
+    try { topicExists = (await admin.fetchTopicMetadata({ topics: [config.topic] })).topics.some((item) => item.name === config.topic); } catch { /* Broker may require topic creation before metadata lookup. */ }
+    return { ok: true, brokers: cluster.brokers.length, controller: cluster.controller, topic: config.topic, topicExists };
+  } catch (error) { throw new Error(`Kafka connection failed: ${error.message}`); }
+  finally { await admin.disconnect().catch(() => {}); }
+}
+
+async function createKafkaTopic(input, { partitions = 1, replicationFactor = 1 } = {}) {
+  const config = normalizeKafkaConfig(input);
+  const admin = createKafkaClient(config).admin();
+  try {
+    await admin.connect();
+    const created = await admin.createTopics({ waitForLeaders: true, topics: [{ topic: config.topic, numPartitions: Math.max(1, Math.min(64, Number(partitions) || 1)), replicationFactor: Math.max(1, Number(replicationFactor) || 1) }] });
+    await recordActivity('Kafka topic configured', `Topic ${config.topic} ${created ? 'created' : 'already exists'}.`);
+    return { created, topic: config.topic };
+  } catch (error) { throw new Error(`Could not create Kafka topic: ${error.message}`); }
+  finally { await admin.disconnect().catch(() => {}); }
+}
+
+function inboxSummary(file) {
+  return { id: file.id, name: file.name, size: file.data?.length || 0, source: file.source, error: file.error || '' };
+}
+
+function getSourceInbox() { return [...sourceInbox.values()].map(inboxSummary); }
+
+function loadInboxFiles(ids) {
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_FILE_COUNT) throw new Error('Choose one or more received NIST files first.');
+  const result = [];
+  for (const id of ids) {
+    const source = sourceInbox.get(String(id));
+    if (!source || !source.data) continue;
+    const fileId = crypto.randomUUID();
+    const file = { id: fileId, name: source.name, data: source.data, sourceInboxId: source.id, source: source.source, kafka: source.kafka };
+    selectedFiles.set(fileId, file);
+    result.push({ id: fileId, name: file.name, size: file.data.length, lastModified: 0 });
+  }
+  if (!result.length) throw new Error('The selected inbox items do not contain valid NIST data.');
+  return result;
+}
+
+async function commitKafkaAcks() {
+  if (!kafkaCurrent?.consumer) return;
+  const partitions = new Map();
+  for (const state of kafkaCurrent.pending.values()) {
+    if (!state.acknowledged) continue;
+    const key = state.partition;
+    const current = partitions.get(key);
+    if (!current || BigInt(state.offset) > BigInt(current.offset)) partitions.set(key, state);
+  }
+  const offsets = [];
+  for (const [partition, latest] of partitions) {
+    const blocked = [...kafkaCurrent.pending.values()].some((state) => state.partition === partition && !state.acknowledged && BigInt(state.offset) < BigInt(latest.offset));
+    if (!blocked) offsets.push({ topic: kafkaCurrent.topic, partition, offset: (BigInt(latest.offset) + 1n).toString() });
+  }
+  if (offsets.length) await kafkaCurrent.consumer.commitOffsets(offsets);
+}
+
+async function startKafkaSource(input) {
+  const config = normalizeKafkaConfig(input);
+  if (kafkaCurrent && [...kafkaCurrent.pending.values()].some((state) => !state.acknowledged)) {
+    throw new Error('Finish importing or explicitly discard the pending Kafka messages before changing the Kafka connection.');
+  }
+  if (kafkaConsumer) {
+    await kafkaConsumer.stop().catch(() => {});
+    await kafkaConsumer.disconnect().catch(() => {});
+  }
+  const consumer = createKafkaClient(config).consumer({ groupId: config.groupId, allowAutoTopicCreation: false });
+  try {
+    await consumer.connect();
+    await consumer.subscribe({ topic: config.topic, fromBeginning: false });
+    kafkaConsumer = consumer;
+    kafkaCurrent = { consumer, topic: config.topic, pending: new Map(), listening: true };
+    await consumer.run({ autoCommit: false, eachMessage: async ({ topic, partition, message }) => {
+      const key = `${topic}:${partition}:${message.offset}`;
+      const state = { topic, partition, offset: message.offset, expected: 0, successful: 0, acknowledged: false };
+      kafkaCurrent.pending.set(key, state);
+      try {
+        let files;
+        if (config.messageFormat === 'raw-nist') {
+          const data = Buffer.from(message.value || []);
+          if (!data.length || data.length > MAX_FILE_BYTES) throw new Error('Kafka NIST message must contain 1 byte to 32 MiB.');
+          const name = message.key?.toString() || `${topic}-${partition}-${message.offset}`;
+          files = [{ name: safeNistName(name), data }];
+        } else {
+          let payload;
+          try { payload = JSON.parse(Buffer.from(message.value || []).toString('utf8')); }
+          catch { throw new Error('Kafka message is not valid JSON.'); }
+          files = normalizeNistSourcePayload(payload);
+        }
+        const ids = addSourceFiles(files, `Kafka · ${topic}`, { topic, partition, offset: message.offset });
+        state.expected = ids.length;
+      } catch (error) {
+        const id = crypto.randomUUID();
+        sourceInbox.set(id, { id, name: `${topic}-${partition}-${message.offset}`, data: null, source: `Kafka · ${topic}`, error: error.message, kafka: { topic, partition, offset: message.offset } });
+      }
+    } });
+    await recordActivity('Kafka source connected', `Listening to topic ${config.topic}.`);
+    return { connected: true, topic: config.topic, groupId: config.groupId };
+  } catch (error) {
+    await consumer.disconnect().catch(() => {});
+    kafkaConsumer = null; kafkaCurrent = null;
+    throw new Error(`Could not start Kafka consumer: ${error.message}`);
+  }
+}
+
+async function pauseKafkaSource() {
+  if (!kafkaCurrent) return { listening: false };
+  kafkaCurrent.consumer.pause([{ topic: kafkaCurrent.topic }]);
+  kafkaCurrent.listening = false;
+  return { listening: false };
+}
+
+async function acknowledgeInboxItem(id) {
+  const item = sourceInbox.get(String(id));
+  if (!item) return { ok: true };
+  if (item.kafka) {
+    const key = `${item.kafka.topic}:${item.kafka.partition}:${item.kafka.offset}`;
+    const state = kafkaCurrent?.pending.get(key);
+    if (state) state.acknowledged = true;
+  }
+  sourceInbox.delete(item.id);
+  await commitKafkaAcks().catch(() => {});
+  return { ok: true };
+}
+
+async function startRestReceiver({ port = 8006 } = {}) {
+  if (restReceiver) return { running: true, port: restReceiver.port, token: restReceiver.token };
+  const selectedPort = Number(port);
+  if (!Number.isInteger(selectedPort) || selectedPort < 1024 || selectedPort > 65535) throw new Error('Choose a local REST port between 1024 and 65535.');
+  const token = crypto.randomBytes(32).toString('base64url');
+  const server = http.createServer(async (request, response) => {
+    response.setHeader('Content-Type', 'application/json');
+    if (request.method === 'GET' && request.url === '/health') { response.writeHead(200); response.end(JSON.stringify({ ok: true, service: 'HERTA local NIST receiver' })); return; }
+    if (request.method !== 'POST' || request.url !== '/api/v1/nist') { response.writeHead(404); response.end(JSON.stringify({ error: 'Use POST /api/v1/nist.' })); return; }
+    const givenToken = String(request.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const supplied = Buffer.from(givenToken); const expected = Buffer.from(token);
+    if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) { response.writeHead(401); response.end(JSON.stringify({ error: 'Invalid bearer token.' })); return; }
+    const chunks = []; let bytes = 0;
+    request.on('data', (chunk) => { bytes += chunk.length; if (bytes > MAX_BATCH_BYTES + 2 * 1024 * 1024) request.destroy(new Error('Request body is too large.')); else chunks.push(chunk); });
+    request.on('end', () => {
+      try {
+        const contentType = String(request.headers['content-type'] || '');
+        let files;
+        if (contentType.includes('application/octet-stream')) {
+          const data = Buffer.concat(chunks);
+          if (!data.length || data.length > MAX_FILE_BYTES) throw new Error('Raw NIST body must be between 1 byte and 32 MiB.');
+          files = [{ name: safeNistName(request.headers['x-file-name'] || 'rest-received'), data }];
+        } else {
+          files = normalizeNistSourcePayload(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        }
+        const ids = addSourceFiles(files, 'Local REST receiver');
+        response.writeHead(202); response.end(JSON.stringify({ accepted: files.length, ids }));
+      } catch (error) { response.writeHead(400); response.end(JSON.stringify({ error: error.message })); }
+    });
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(selectedPort, '127.0.0.1', resolve); });
+  restReceiver = { server, port: selectedPort, token };
+  await recordActivity('Local REST receiver started', `Listening on 127.0.0.1:${selectedPort}.`);
+  return { running: true, port: selectedPort, token };
+}
+
+async function stopRestReceiver() {
+  if (!restReceiver) return { running: false };
+  const current = restReceiver; restReceiver = null;
+  await new Promise((resolve) => current.server.close(() => resolve()));
+  return { running: false };
+}
+
+function getPickedFiles(ids) {
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_FILE_COUNT) throw new Error(`Choose between 1 and ${MAX_FILE_COUNT} NIST files.`);
+  return ids.map((id) => {
+    const file = selectedFiles.get(String(id));
+    if (!file) throw new Error('The file selection expired. Choose the files again.');
+    return file;
+  });
+}
+
+async function prepareImport(ids) {
+  const files = getPickedFiles(ids);
+  const rows = [];
+  const accepted = [];
+  let total = 0;
+  for (const file of files) {
+    const size = file.data !== undefined ? file.data.length : (await fs.stat(file.path)).size;
+    if (!file.name.toLowerCase().endsWith('.nist')) {
+      rows.push({ File: file.name, Code: file.name, Status: 'Rejected', Bytes: size, Message: 'Only .nist files are accepted.' });
+    } else if (size > MAX_FILE_BYTES) {
+      rows.push({ File: file.name, Code: file.name.slice(0, -5), Status: 'Rejected', Bytes: size, Message: 'File exceeds 32 MiB.' });
+    } else if (total + size > MAX_BATCH_BYTES) {
+      rows.push({ File: file.name, Code: file.name.slice(0, -5), Status: 'Rejected', Bytes: size, Message: 'Batch exceeds 256 MiB.' });
+    } else {
+      accepted.push({ ...file, size });
+      total += size;
+    }
+  }
+  return { accepted, rows };
+}
+
+async function runImport({ ids, group = '0', confirmation = '' }) {
+  const session = assertSignedIn();
+  if (confirmation !== 'IMPORT') throw new Error('Type IMPORT to confirm sending biometric data to HERTA.');
+  const { accepted, rows } = await prepareImport(ids);
+  for (const file of accepted) {
+    const row = { File: file.name, Code: file.name.slice(0, -5), Status: 'Failed', HttpStatus: '', Bytes: file.size, Message: '' };
+    try {
+      const data = file.data !== undefined ? file.data : await fs.readFile(file.path);
+      const response = await requestJson(session.baseUrl, session.verifyTls, '/api/v1/subjects/import', {
+        method: 'POST',
+        token: session.token,
+        json: { data: data.toString('base64'), format: 'nist', group: String(group) },
+      });
+      row.Status = 'HTTP_SUCCESS';
+      row.Message = 'Server returned success; verify subject in HERTA.';
+      row.HttpStatus = 200;
+    } catch (error) {
+      row.Status = 'HTTP_ERROR';
+      row.HttpStatus = error.status || '';
+      row.Message = error.message;
+    }
+    rows.push(row);
+  }
+  const succeeded = rows.filter((row) => row.Status === 'HTTP_SUCCESS').length;
+  for (const file of accepted) {
+    const result = rows.find((row) => row.File === file.name && row.Status === 'HTTP_SUCCESS');
+    if (!result || !file.sourceInboxId) continue;
+    const inboxItem = sourceInbox.get(file.sourceInboxId);
+    sourceInbox.delete(file.sourceInboxId);
+    if (inboxItem?.kafka && kafkaCurrent) {
+      const ref = inboxItem.kafka;
+      const state = kafkaCurrent.pending.get(`${ref.topic}:${ref.partition}:${ref.offset}`);
+      if (state) { state.successful += 1; if (state.successful >= state.expected) state.acknowledged = true; }
+    }
+  }
+  await commitKafkaAcks().catch(() => {});
+  await recordActivity('NIST import', `${succeeded} of ${rows.length} file imports succeeded.`);
+  return { results: rows, executed: true };
+}
+
+async function saveReport({ rows, kind = 'import' }) {
+  if (!Array.isArray(rows)) throw new Error('There is no report to save.');
+  const exportReport = kind === 'export';
+  const columns = exportReport ? ['Code', 'Status', 'Bytes', 'Details'] : ['File', 'Code', 'Status', 'HttpStatus', 'Bytes', 'Message'];
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save HERTA report',
+    defaultPath: path.join(app.getPath('downloads'), `herta-${kind}-report.csv`),
+    filters: [{ name: 'CSV file', extensions: ['csv'] }],
+  });
+  if (result.canceled || !result.filePath) return { canceled: true };
+  await fs.writeFile(result.filePath, toCsv(rows, columns), 'utf8');
+  return { canceled: false, path: result.filePath };
+}
+
+async function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1320,
+    height: 900,
+    minWidth: 840,
+    minHeight: 620,
+    title: `HERTA Operations v${app.getVersion()}`,
+    backgroundColor: '#f7f8fa',
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+    },
+  });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, target) => {
+    if (!target.startsWith(APP_URL)) event.preventDefault();
+  });
+  if (DEV_SERVER_URL) await mainWindow.loadURL(DEV_SERVER_URL);
+  else await mainWindow.loadFile(APP_PAGE);
+  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.on('closed', () => { mainWindow = null; hertaSession = null; selectedFiles.clear(); });
+}
+
+function registerIpc() {
+  const handle = (channel, callback) => ipcMain.handle(channel, (event, ...args) => {
+    assertTrusted(event);
+    return callback(...args);
+  });
+  handle('app:config', () => ({
+    baseUrl: process.env.HERTA_BASE_URL || 'https://localhost:8005',
+    version: app.getVersion(),
+    // HERTA deployments often use a private or self-signed certificate.
+    // Verification is an explicit sign-in choice in the desktop UI.
+    verifyTls: false,
+  }));
+  handle('herta:session', () => ({ authenticated: Boolean(hertaSession?.token), baseUrl: hertaSession?.baseUrl || '' }));
+  handle('herta:login', async ({ baseUrl, username, password, verifyTls }) => {
+    if (!String(username || '').trim() || !String(password || '')) throw new Error('Enter your HERTA username and password.');
+    const normalized = normalizeBaseUrl(baseUrl);
+    const verified = Boolean(verifyTls);
+    const response = await requestJson(normalized, verified, '/api/v1/auth/login', {
+      method: 'POST',
+      json: { username: String(username).trim(), password: String(password) },
+    });
+    const token = response.access_token || response.accessToken;
+    if (!token) throw new Error('HERTA sign-in did not return an access token.');
+    hertaSession = { baseUrl: normalized, verifyTls: verified, token: String(token) };
+    await recordActivity('Signed in', 'A HERTA desktop session started.');
+    return { authenticated: true, baseUrl: normalized };
+  });
+  handle('herta:logout', () => {
+    if (hertaSession) void recordActivity('Signed out', 'The HERTA desktop session ended.');
+    hertaSession = null; selectedFiles.clear(); void pauseKafkaSource(); return { ok: true };
+  });
+  handle('herta:subjects', async ({ query = '' } = {}) => {
+    const subjects = await getAllSubjects();
+    const normalized = String(query).trim().toLocaleLowerCase();
+    const filtered = normalized ? subjects.filter((item) => {
+      const searchable = Object.entries(item).filter(([key, value]) => key !== 'profile' && value != null && typeof value !== 'object').map(([, value]) => String(value)).join(' ');
+      return searchable.toLocaleLowerCase().includes(normalized);
+    }) : subjects;
+    return {
+      subjects: filtered.map(summarizeSubject),
+      count: filtered.length,
+      server_count: subjects.length,
+    };
+  });
+  handle('herta:subject-detail', getSubjectDetails);
+  handle('herta:profiles', profileCheck);
+  handle('herta:export', exportSubjects);
+  handle('herta:backup', createBackup);
+  handle('herta:health', checkHertaHealth);
+  handle('herta:audit', async () => readAuditEvents());
+  handle('source:rest-fetch', fetchRestSource);
+  handle('source:kafka-test', testKafkaConnection);
+  handle('source:kafka-create-topic', (config, topicOptions) => createKafkaTopic(config, topicOptions));
+  handle('source:kafka-start', startKafkaSource);
+  handle('source:kafka-pause', pauseKafkaSource);
+  handle('source:inbox', () => getSourceInbox());
+  handle('source:inbox-load', loadInboxFiles);
+  handle('source:inbox-discard', acknowledgeInboxItem);
+  handle('source:rest-receiver-start', startRestReceiver);
+  handle('source:rest-receiver-stop', stopRestReceiver);
+  handle('files:pick-import', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose HERTA NIST files',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'NIST files', extensions: ['nist'] }],
+    });
+    if (result.canceled) return [];
+    selectedFiles.clear();
+    return Promise.all(result.filePaths.slice(0, MAX_FILE_COUNT).map(async (filePath, index) => {
+      const stat = await fs.stat(filePath);
+      const id = `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
+      const file = { id, path: filePath, name: path.basename(filePath) };
+      selectedFiles.set(id, file);
+      return { id, name: file.name, size: stat.size, lastModified: stat.mtimeMs };
+    }));
+  });
+  handle('files:pick-backup', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose a HERTA snapshot ZIP to restore',
+      properties: ['openFile'],
+      filters: [{ name: 'HERTA backup ZIP', extensions: ['zip'] }],
+    });
+    if (result.canceled || !result.filePaths[0]) return [];
+    const stat = await fs.stat(result.filePaths[0]);
+    if (stat.size > MAX_BACKUP_BYTES) throw new Error('Backup ZIP exceeds the 256 MiB limit.');
+    const archive = await fs.readFile(result.filePaths[0]);
+    const entries = inspectBackupArchive(archive);
+    const nistNames = [...entries].filter(([, entry]) => entry.isNist);
+    if (!nistNames.length) throw new Error('Backup ZIP does not contain any .nist files.');
+    selectedFiles.clear();
+    const unzipped = unzipSync(archive);
+    let total = 0;
+    return nistNames.map(([name, entry], index) => {
+      const bytes = unzipped[name];
+      if (!bytes || bytes.length !== entry.uncompressedSize) throw new Error(`Backup entry ${name} is damaged.`);
+      if (bytes.length > MAX_FILE_BYTES || total + bytes.length > MAX_BATCH_BYTES) {
+        throw new Error('Restored NIST files exceed the 32 MiB per-file or 256 MiB batch limit.');
+      }
+      total += bytes.length;
+      const id = `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
+      selectedFiles.set(id, { id, name, data: Buffer.from(bytes) });
+      return { id, name, size: bytes.length, lastModified: 0 };
+    });
+  });
+  handle('herta:import-preview', async ({ ids, group = '0' }) => {
+    const { accepted, rows } = await prepareImport(ids);
+    rows.push(...accepted.map((file) => ({
+      File: file.name,
+      Code: file.name.slice(0, -5),
+      Status: 'DryRun',
+      Bytes: file.size,
+      Message: `Not sent to HERTA. Group: ${String(group)}.`,
+    })));
+    await recordActivity('Import preview', `${accepted.length} NIST files inspected; none were sent.`);
+    return { results: rows, executed: false };
+  });
+  handle('herta:import', runImport);
+  handle('files:save-report', saveReport);
+}
+
+app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
+  registerIpc();
+  await createWindow();
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+});
+
+app.on('before-quit', () => {
+  hertaSession = null; selectedFiles.clear();
+  if (kafkaConsumer) void kafkaConsumer.disconnect().catch(() => {});
+  if (restReceiver) void stopRestReceiver();
+});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

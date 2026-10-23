@@ -1,0 +1,5 @@
+.login-card .tls-option{display:flex;align-items:center;gap:8px;font-weight:500}
+.login-card .tls-option input{width:14px;height:14px;margin:0;accent-color:var(--blue)}
+.browse-files{margin-top:10px}
+.dropzone{cursor:default}
+.dropzone:hover{background:#fbfcfe;border-color:#cdd7e6}
