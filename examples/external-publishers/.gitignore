@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/
+*.nist
+*.an2
+*.eft
+*.dat
+*.pem
+*.key
+*.log
