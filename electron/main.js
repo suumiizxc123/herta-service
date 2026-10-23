@@ -9,6 +9,7 @@ const { unzipSync } = require('fflate');
 const { Kafka, logLevel } = require('kafkajs');
 const { createZip, inspectBackupArchive } = require('./backup-archive');
 const { MAX_FILES, safeNistName, normalizeNistSourcePayload } = require('./source-files');
+const { mergeHttpHeaders } = require('./http-headers');
 const { profileToText, subjectGroup, extractSubjectImage, extractImageFromNistBytes, summarizeSubject, makeSubjectDetails } = require('./subject-record');
 const { parseCron, nextCronDate } = require('./cron');
 const DockerPlatform = require('./docker-platform');
@@ -198,7 +199,7 @@ function normalizeBaseUrl(value) {
   return target.toString().replace(/\/$/, '');
 }
 
-function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json } = {}) {
+function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json, headers: customHeaders } = {}) {
   const target = new URL(pathname, `${baseUrl}/`);
   const payload = json === undefined ? null : Buffer.from(JSON.stringify(json), 'utf8');
   const headers = { Accept: 'application/json', 'Accept-Language': 'en' };
@@ -207,12 +208,13 @@ function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json
     headers['Content-Length'] = payload.length;
   }
   if (token) headers.Authorization = `Bearer ${token}`;
+  const requestHeaders = mergeHttpHeaders(headers, customHeaders || {});
   const transport = target.protocol === 'https:' ? https : http;
 
   return new Promise((resolve, reject) => {
     const request = transport.request(target, {
       method,
-      headers,
+      headers: requestHeaders,
       rejectUnauthorized: target.protocol !== 'https:' || verifyTls,
       timeout: 45_000,
     }, (response) => {
@@ -447,9 +449,9 @@ function addSourceFiles(files, source, kafka = null) {
   return ids;
 }
 
-async function fetchRestSource({ url, bearerToken = '', verifyTls = true } = {}) {
+async function fetchRestSource({ url, bearerToken = '', verifyTls = true, headers = {} } = {}) {
   const target = normalizeSourceUrl(url);
-  const response = await requestJson(target, Boolean(verifyTls), target, { token: String(bearerToken || '').trim() || undefined });
+  const response = await requestJson(target, verifyTls !== false, target, { token: String(bearerToken || '').trim() || undefined, headers });
   const files = normalizeNistSourcePayload(response);
   const ids = addSourceFiles(files, 'REST source');
   await recordActivity('REST source received', `${files.length} NIST files read from a configured REST endpoint.`);

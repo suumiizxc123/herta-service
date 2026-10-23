@@ -1,4 +1,4 @@
-# HERTA Operations Desktop 1.9.18
+# HERTA Operations Desktop 1.9.19
 
 Electron is the control interface. A Docker Compose worker handles REST intake, Kafka consumption, the persistent review inbox, and scheduled NIST ZIP backups independently of the Electron window. Windows requires Docker Desktop with its engine running; install/start Docker Desktop before using **Start workers** on the Dashboard page.
 
@@ -9,7 +9,7 @@ Electron is the control interface. A Docker Compose worker handles REST intake, 
 - The Connectors page stores named REST pull, REST receiver, Kafka, and PostgreSQL backup definitions. Active REST polling, REST intake, and Kafka consumption run in the Docker worker, independently of the Electron window. Connector changes are persisted in the worker volume and resumed after a worker restart.
 - Kafka messages are consumed by the worker with manual offset commits after the matching NIST inbox items are imported or discarded.
 - Desktop connector settings are encrypted in the desktop profile. The worker also stores its active connector configuration and HERTA access token in its persistent Docker volume with owner-only file permissions so scheduled work can continue while Electron is closed. Signing out clears the worker's HERTA token. Protect the Docker volume and selected backup folder as sensitive data.
-- REST pull connectors poll the configured API URL on a worker interval and de-duplicate repeated NIST files. Kafka messages are consumed by the worker with manual offset commits after the matching NIST inbox items are imported or discarded.
+- REST pull connectors poll the configured endpoint every 60 seconds, send any custom request headers, and de-duplicate repeated NIST files. Kafka messages are consumed by the worker with manual offset commits after the matching NIST inbox items are imported or discarded.
 - Telegram can be configured with a bot token and chat ID; the worker sends a notification when it receives NIST files from REST or Kafka and supports a test message from the Telegram page.
 - Scheduled backups run inside the worker, write to the chosen Windows folder, retry a failed run up to three times, and continue when the Electron window closes while Docker remains running. HERTA snapshots contain exported NIST subject files in ZIP format. Active PostgreSQL backup connectors run `pg_dump` in custom format and save a complete logical dump of the configured database as `.dump`; they are included in both scheduled and manual backups. Database dumps are not physical cluster images and do not include cluster-wide roles or tablespaces. Choose a retention limit in Backup settings; old timestamped snapshots and database dumps are pruned to that limit.
 - The Dashboard can additionally start a local Kafka broker (`localhost:19092`) or a single-node Elasticsearch instance (`localhost:19200`). These are optional local services; the worker can also connect to an existing Kafka broker.

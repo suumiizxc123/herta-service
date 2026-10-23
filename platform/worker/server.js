@@ -8,6 +8,7 @@ const { Kafka, logLevel } = require('kafkajs');
 const { createZip } = require('../../electron/backup-archive');
 const { MAX_FILE_BYTES, MAX_BATCH_BYTES, normalizeNistSourcePayload, safeNistName } = require('../../electron/source-files');
 const { parseCron, matchesCron, nextCronDate } = require('../../electron/cron');
+const { mergeHttpHeaders } = require('../../electron/http-headers');
 
 const PORT = Number(process.env.PORT || 8127);
 const DATA_DIR = process.env.DATA_DIR || '/data';
@@ -99,7 +100,7 @@ async function pollRestConnector(connector) {
   try {
     const target = new URL(String(connector.config?.url || ''));
     if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
-    const response = await requestJson(target.origin, Boolean(connector.config.verifyTls), target.href, { token: String(connector.config.bearerToken || '') || undefined });
+    const response = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { token: String(connector.config.bearerToken || '') || undefined, headers: connector.config.headers });
     const files = normalizeNistSourcePayload(response);
     const seen = new Set(Array.isArray(connector.seen) ? connector.seen : []);
     const fresh = files.filter((item) => {
@@ -214,15 +215,16 @@ async function sendTelegramMessage(text) {
   }
 }
 
-function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json } = {}) {
+function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json, headers: customHeaders } = {}) {
   const target = new URL(pathname, `${baseUrl}/`);
   const payload = json === undefined ? null : Buffer.from(JSON.stringify(json));
   const headers = { Accept: 'application/json' };
   if (payload) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = payload.length; }
   if (token) headers.Authorization = `Bearer ${token}`;
+  const requestHeaders = mergeHttpHeaders(headers, customHeaders || {});
   const transport = target.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
-    const request = transport.request(target, { method, headers, rejectUnauthorized: target.protocol !== 'https:' || verifyTls, timeout: 45000 }, (response) => {
+    const request = transport.request(target, { method, headers: requestHeaders, rejectUnauthorized: target.protocol !== 'https:' || verifyTls, timeout: 45000 }, (response) => {
       const chunks = []; let size = 0;
       response.on('data', (chunk) => { size += chunk.length; if (size > 64 * 1024 * 1024) { request.destroy(new Error('HERTA response exceeded the 64 MiB limit.')); return; } chunks.push(chunk); });
       response.on('end', () => {
@@ -505,7 +507,7 @@ async function route(request, response) {
       if (!connector || connector.type !== 'rest' || connector.mode !== 'pull') throw new Error('Choose a saved REST pull connector to test.');
       const target = new URL(String(connector.config?.url || ''));
       if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
-      const payload = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { token: String(connector.config.bearerToken || '') || undefined });
+      const payload = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { token: String(connector.config.bearerToken || '') || undefined, headers: connector.config.headers });
       const files = normalizeNistSourcePayload(payload);
       return json(response, 200, { ok: true, count: files.length, bytes: files.reduce((total, item) => total + item.data.length, 0), checkedAt: new Date().toISOString() });
     }
