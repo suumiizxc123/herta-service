@@ -5,3 +5,4 @@ release/
 dist/
 *.log
 release-updated/
+/platform/license-service/data/

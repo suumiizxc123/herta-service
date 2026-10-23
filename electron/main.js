@@ -102,9 +102,6 @@ async function restoreHertaSession() {
     const baseUrl = normalizeBaseUrl(restored.baseUrl);
     const candidate = { ...restored, baseUrl, token: String(restored.token), verifyTls: Boolean(restored.verifyTls) };
     hertaSession = candidate;
-    const response = await desktopAuth.request(active => requestJson(baseUrl, active.verifyTls, '/api/v1/subjects?offset=0&size=1', { token: active.token }));
-    if (!Array.isArray(response.subjects)) throw new Error('Saved HERTA session could not be verified.');
-    hertaSession = candidate;
     await DockerPlatform.setWorkerSession(app, hertaSession);
   } catch (error) {
     hertaSession = null;
@@ -265,6 +262,8 @@ function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json
 const desktopAuth = createHertaAuth({ getSession: () => hertaSession, login: active => requestJson(active.baseUrl, active.verifyTls, '/api/v1/auth/login', { method: 'POST', json: { username: active.username, password: active.password } }), persist: persistHertaSession });
 async function authorizedJson(pathname, options = {}) {
  assertSignedIn();
+ const license = await DockerPlatform.workerRequest(app, '/api/license/status');
+ if (!license.valid) throw new Error('A valid HERTA Operations license is required.');
  const status = await DockerPlatform.workerRequest(app, '/api/status').catch(() => null);
  if (status?.ok && status.authenticated) return DockerPlatform.workerRequest(app, '/api/herta/request', { method: 'POST', body: { pathname, options }, timeout: 150000 });
  return desktopAuth.request(active => requestJson(active.baseUrl, active.verifyTls, pathname, { ...options, token: active.token }));
@@ -789,8 +788,19 @@ async function createWindow() {
 }
 
 function registerIpc() {
+  const licenseProtectedChannels = new Set([
+    'connectors:settings-save', 'connectors:telegram-chats', 'connectors:telegram-test', 'herta:subjects',
+    'herta:subject-detail', 'herta:profiles', 'herta:export', 'herta:backup-settings-save', 'herta:backup',
+    'source:rest-fetch', 'source:kafka-test', 'source:kafka-create-topic', 'source:kafka-start', 'source:kafka-pause',
+    'source:inbox', 'source:inbox-load', 'source:inbox-discard', 'source:rest-receiver-start', 'source:rest-receiver-stop',
+    'files:pick-import', 'files:pick-backup', 'herta:import-preview', 'herta:import',
+  ]);
   const handle = (channel, callback) => ipcMain.handle(channel, (event, ...args) => {
     assertTrusted(event);
+    if (licenseProtectedChannels.has(channel)) return DockerPlatform.workerRequest(app, '/api/license/status').then(status => {
+      if (!status.valid) throw new Error(`A valid HERTA Operations license is required${status.expiresAt ? ` (expired ${new Date(status.expiresAt).toLocaleString()})` : ''}.`);
+      return callback(...args);
+    });
     return callback(...args);
   });
   handle('app:config', () => ({
@@ -801,6 +811,19 @@ function registerIpc() {
     verifyTls: false,
   }));
   handle('platform:status', () => DockerPlatform.platformStatus(app));
+  handle('platform:license-config', () => DockerPlatform.getLicenseConfig(app));
+  handle('platform:license-config-save', async (settings) => {
+    const result = await DockerPlatform.configureLicense(app, settings);
+    if (result.status?.worker?.license?.valid) {
+      if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);
+      const connectors = await readConnectorSettings();
+      const backupSettings = await readBackupSettings();
+      await DockerPlatform.workerRequest(app, '/api/connectors', { method: 'PUT', body: connectorsForWorker(connectors.connectors, result.status) }).catch(() => {});
+      await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: backupSettings.enabled, cron: backupSettings.cron, timezone: backupSettings.timezone, retentionCount: backupSettings.retentionCount } }).catch(() => {});
+      if (connectors.telegram.botToken && connectors.telegram.chatId) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: connectors.telegram }).catch(() => {});
+    }
+    return { url: result.url, configured: result.configured, status: result.status };
+  });
   handle('platform:start', async (options) => {
     const status = await DockerPlatform.startPlatform(app, options || {});
     if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);

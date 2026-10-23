@@ -11,6 +11,8 @@ services:
       DATA_DIR: /data
       BACKUP_DIR: /backups
       WORKER_API_TOKEN: ${HERTA_WORKER_API_TOKEN:?Set HERTA_WORKER_API_TOKEN in the generated environment file}
+      HERTA_LICENSE_URL: ${HERTA_LICENSE_URL:-}
+      HERTA_LICENSE_KEY: ${HERTA_LICENSE_KEY:-}
     ports:
       - "127.0.0.1:18127:8127"
     volumes:

@@ -1,0 +1,8 @@
+{
+  "name": "herta-license-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "License issuer and validator for HERTA Operations",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server.js" }
+}

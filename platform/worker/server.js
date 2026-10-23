@@ -10,6 +10,7 @@ const { createZip } = require('../../electron/backup-archive');
 const { MAX_FILE_BYTES, MAX_BATCH_BYTES, normalizeNistSourcePayload, safeNistName } = require('../../electron/source-files');
 const { parseCron, matchesCron, nextCronDate } = require('../../electron/cron');
 const { mergeHttpHeaders } = require('../../electron/http-headers');
+const { LicenseClient } = require('../license-client');
 
 const PORT = Number(process.env.PORT || 8127);
 const DATA_DIR = process.env.DATA_DIR || '/data';
@@ -32,11 +33,14 @@ let telegramConfig = { botToken: '', chatId: '' };
 let telegramStatus = { configured: false, connected: false, botName: '', checkedAt: null, lastError: '' };
 let backupSettings = { enabled: false, cron: '0 2 * * *', timezone: 'UTC', retentionCount: 30, lastScheduledKey: '', lastRunAt: null, lastRunStatus: 'idle', lastRunMessage: '' };
 let backupBusy = false;
+let activeBackupChild = null;
 let connectors = [];
 const connectorRuntimes = new Map();
 const restPollers = new Map();
 let connectorPersistQueue = Promise.resolve();
 let scheduler;
+const licensing = new LicenseClient({ url: process.env.HERTA_LICENSE_URL, key: process.env.HERTA_LICENSE_KEY, dataDir: DATA_DIR });
+let licensedServicesBusy = false;
 const startedAt = new Date().toISOString();
 
 async function ensureFolders() { await fs.mkdir(INBOX_DIR, { recursive: true }); await fs.mkdir(BACKUP_DIR, { recursive: true }); }
@@ -102,6 +106,7 @@ async function pollRestConnector(connector, { throwOnError = false } = {}) {
     const target = new URL(String(connector.config?.url || ''));
     if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
     const response = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { headers: Object.fromEntries(Object.entries(connector.config.headers || {}).filter(([key]) => !/^(authorization|proxy-authorization)$/i.test(key))) });
+    if (!licensing.isValid()) throw new Error('License expired during REST polling.');
     const files = normalizeNistSourcePayload(response);
     const seen = new Set(Array.isArray(connector.seen) ? connector.seen : []);
     const fresh = files.filter((item) => {
@@ -209,6 +214,7 @@ async function checkTelegram() {
 }
 
 async function sendTelegramMessage(text) {
+  if (!licensing.isValid()) return;
   if (!telegramConfig.botToken || !telegramConfig.chatId) return;
   try {
     await telegramRequest('sendMessage', { chat_id: telegramConfig.chatId, text });
@@ -259,7 +265,10 @@ async function persistSession(value) {
  } else await fs.rm(credentialsFile, { force: true });
 }
 const hertaAuth = createHertaAuth({ getSession: () => session, login: active => requestJson(active.baseUrl, active.verifyTls, '/api/v1/auth/login', { method: 'POST', json: { username: active.username, password: active.password } }), persist: persistSession });
-async function hertaJson(pathname, options) { return hertaAuth.request(active => requestJson(active.baseUrl, active.verifyTls, pathname, { ...options, token: active.token })); }
+async function hertaJson(pathname, options) {
+  if (!licensing.isValid()) throw new Error('A valid HERTA Operations license is required.');
+  return hertaAuth.request(active => requestJson(active.baseUrl, active.verifyTls, pathname, { ...options, token: active.token }));
+}
 async function importRestFiles(ids, group = '0') {
  const results = [];
  for (const id of ids) {
@@ -287,10 +296,12 @@ async function getAllSubjects() {
   return records;
 }
 async function createBackup(scheduled = false) {
+  if (!licensing.isValid()) throw new Error('A valid HERTA Operations license is required.');
   const records = await getAllSubjects();
   if (!records.length) throw new Error('HERTA has no subjects to back up.');
   const files = []; const results = []; let totalBytes = 0;
   for (const subject of records) {
+    if (!licensing.isValid()) throw new Error('License expired during HERTA backup.');
     const code = String(subject.code || '').trim();
     if (!code) continue;
     try {
@@ -309,6 +320,7 @@ async function createBackup(scheduled = false) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const destination = path.join(BACKUP_DIR, `herta-snapshot-${stamp}.zip`);
   const archive = createZip(files);
+  if (!licensing.isValid()) throw new Error('License expired during HERTA backup.');
   if (archive.length > MAX_BATCH_BYTES) throw new Error('Snapshot ZIP exceeds the 256 MiB size limit.');
   await fs.writeFile(destination, archive, { mode: 0o600, flag: 'wx' });
   const snapshots = (await fs.readdir(BACKUP_DIR, { withFileTypes: true }))
@@ -325,6 +337,7 @@ async function createBackup(scheduled = false) {
 
 async function persistSchedule() { await writeJson(path.join(DATA_DIR, 'backup-settings.json'), backupSettings); }
 async function tickBackup() {
+  if (!licensing.isValid()) return;
   const hasDatabaseBackup = connectors.some((item) => item.active && item.type === 'postgres');
   if (backupBusy || !backupSettings.enabled || (!session?.token && !hasDatabaseBackup)) return;
   const now = new Date();
@@ -368,6 +381,7 @@ async function startKafka(input) {
   saveRuntime(connectorId, { status: 'active', lastError: '' });
   await recordConnectorEvent(connectors.find((item) => item.id === connectorId), 'Consumer started', 'active', `Topic ${config.topic} · group ${config.groupId}`);
   await consumer.run({ autoCommit: false, eachMessage: async ({ topic, partition, message }) => {
+    if (!licensing.isValid()) return;
     try {
       let files;
       if (config.messageFormat === 'raw-nist') files = [{ name: safeNistName(message.key?.toString() || `${topic}-${partition}-${message.offset}`), data: Buffer.from(message.value || []) }];
@@ -377,6 +391,7 @@ async function startKafka(input) {
         catch { throw new Error('This message is not valid JSON. Expected a JSON NIST envelope with a Base64 fileContent field. If the topic contains raw NIST bytes, change Message format to “Raw NIST bytes”.'); }
         files = normalizeNistSourcePayload(payload);
       }
+      if (!licensing.isValid()) throw new Error('A valid HERTA Operations license is required.');
       await addFiles(files, `Kafka · ${topic}`, { topic, partition, offset: message.offset }, connectorId);
       const runtime = connectorRuntimes.get(connectorId) || {};
       saveRuntime(connectorId, { status: 'active', lastRunAt: new Date().toISOString(), lastError: '', received: (runtime.received || 0) + files.length });
@@ -408,6 +423,10 @@ async function applyConnectors(nextConnectors) {
   await stopConnectorRuntimes();
   connectors = normalized; await persistConnectors();
   connectorRuntimes.clear();
+  if (!licensing.isValid()) {
+    for (const connector of connectors) if (connector.active) saveRuntime(connector.id, { status: 'license-required', lastError: 'A valid HERTA Operations license is required.' });
+    return connectors.map(connectorSummary);
+  }
   for (const connector of connectors.filter((item) => item.active)) {
     try {
       if (connector.type === 'kafka') await startKafka({ ...connector.config, connectorId: connector.id, connectorName: connector.name });
@@ -427,6 +446,7 @@ async function applyConnectors(nextConnectors) {
 }
 
 async function createPostgresBackup(connector, scheduled = false) {
+  if (!licensing.isValid()) throw new Error('A valid HERTA Operations license is required.');
   const config = connector.config || {};
   const host = String(config.host || '').trim(); const database = String(config.database || '').trim(); const username = String(config.username || '').trim();
   const port = Math.max(1, Math.min(65535, Number(config.port) || 5432));
@@ -439,10 +459,11 @@ async function createPostgresBackup(connector, scheduled = false) {
   const pgEnv = { ...process.env, PGPASSWORD: String(config.password), PGSSLMODE: config.sslMode === 'disable' ? 'disable' : config.sslMode === 'prefer' ? 'prefer' : 'require' };
   await new Promise((resolve, reject) => {
     const child = spawn('pg_dump', args, { env: pgEnv, stdio: ['ignore', 'ignore', 'pipe'] });
+    activeBackupChild = child;
     let stderr = ''; const timer = setTimeout(() => child.kill('SIGTERM'), 2 * 60 * 60 * 1000); timer.unref?.();
     child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk.toString('utf8')}`.slice(-4000); });
-    child.once('error', (error) => { clearTimeout(timer); reject(new Error(error.code === 'ENOENT' ? 'The worker image does not have pg_dump installed. Rebuild workers from Dashboard.' : error.message)); });
-    child.once('close', (code) => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error(`pg_dump failed with exit code ${code}: ${stderr.trim().slice(-1200)}`)); });
+    child.once('error', (error) => { clearTimeout(timer); activeBackupChild = null; reject(new Error(error.code === 'ENOENT' ? 'The worker image does not have pg_dump installed. Rebuild workers from Dashboard.' : error.message)); });
+    child.once('close', (code) => { clearTimeout(timer); activeBackupChild = null; if (!licensing.isValid()) reject(new Error('License expired during PostgreSQL backup.')); else if (code === 0) resolve(); else reject(new Error(`pg_dump failed with exit code ${code}: ${stderr.trim().slice(-1200)}`)); });
   }).catch(async (error) => { await fs.rm(temporary, { force: true }); throw error; });
   const stat = await fs.stat(temporary); if (!stat.size) { await fs.rm(temporary, { force: true }); throw new Error('PostgreSQL produced an empty backup file.'); }
   await fs.rename(temporary, destination);
@@ -457,8 +478,10 @@ async function createPostgresBackup(connector, scheduled = false) {
 }
 
 async function runBackupTasks(scheduled = false) {
+  if (!licensing.isValid()) throw new Error('A valid HERTA Operations license is required.');
   const results = []; const failures = [];
   const runTask = async (label, task) => {
+    if (!licensing.isValid()) throw new Error('License expired during backup.');
     const attempts = scheduled ? 3 : 1;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try { results.push(await task()); return; }
@@ -502,6 +525,7 @@ async function route(request, response) {
   const url = new URL(request.url, 'http://localhost');
   if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'herta-worker', startedAt });
   if (url.pathname === '/api/v1/nist' && request.method === 'POST') {
+    if (!licensing.isValid()) return json(response, 423, { error: 'A valid HERTA Operations license is required.', license: licensing.getStatus() });
     if (!receiverToken) return json(response, 409, { error: 'Activate the REST receiver first.' });
     try {
       const body = await readBody(request); let files;
@@ -509,6 +533,7 @@ async function route(request, response) {
         if (!body.length || body.length > MAX_FILE_BYTES) throw new Error('Raw NIST data must be 1 byte to 32 MiB.');
         files = [{ name: safeNistName(request.headers['x-file-name']), data: body }];
       } else files = normalizeNistSourcePayload(JSON.parse(body.toString('utf8')));
+      if (!licensing.isValid()) return json(response, 423, { error: 'A valid HERTA Operations license is required.', license: licensing.getStatus() });
     const ids = await addFiles(files, 'REST receiver', null, receiverConnectorId);
     if (receiverConnectorId) {
       const runtime = connectorRuntimes.get(receiverConnectorId) || {};
@@ -520,9 +545,11 @@ async function route(request, response) {
   }
   if (!requireApi(request, response)) return;
   try {
+    if (request.method === 'GET' && url.pathname === '/api/license/status') return json(response, 200, licensing.getStatus());
     if (request.method === 'GET' && url.pathname === '/api/status') return json(response, 200, {
-      ok: true, service: 'herta-worker', startedAt, authenticated: Boolean(session?.token), authentication: { automaticRenewal: Boolean(session?.username && session?.password), lastRenewedAt: session?.authenticatedAt || null, nextRenewalAt: session?.username ? new Date((session.authenticatedAt || 0) + 3600000).toISOString() : null }, backup: { enabled: backupSettings.enabled, cron: backupSettings.cron, timezone: backupSettings.timezone, retentionCount: backupSettings.retentionCount, nextRun: backupSettings.enabled ? nextCronDate(backupSettings.cron, new Date(), backupSettings.timezone).toISOString() : null, running: backupBusy, lastRunAt: backupSettings.lastRunAt, lastRunStatus: backupSettings.lastRunStatus, lastRunMessage: backupSettings.lastRunMessage }, kafka: kafkaInfo || { listening: false }, receiver: { running: Boolean(receiverToken), connectorId: receiverConnectorId, port: 18127, authenticationRequired: false, url: 'http://127.0.0.1:18127/api/v1/nist' }, telegram: telegramStatus, connectors: connectors.map(connectorSummary), inbox: [...inbox.values()].map(inboxSummary),
+      ok: true, service: 'herta-worker', startedAt, license: licensing.getStatus(), authenticated: Boolean(session?.token), authentication: { automaticRenewal: Boolean(session?.username && session?.password), lastRenewedAt: session?.authenticatedAt || null, nextRenewalAt: session?.username ? new Date((session.authenticatedAt || 0) + 3600000).toISOString() : null }, backup: { enabled: backupSettings.enabled, cron: backupSettings.cron, timezone: backupSettings.timezone, retentionCount: backupSettings.retentionCount, nextRun: backupSettings.enabled ? nextCronDate(backupSettings.cron, new Date(), backupSettings.timezone).toISOString() : null, running: backupBusy, lastRunAt: backupSettings.lastRunAt, lastRunStatus: backupSettings.lastRunStatus, lastRunMessage: backupSettings.lastRunMessage }, kafka: kafkaInfo || { listening: false }, receiver: { running: Boolean(receiverToken), connectorId: receiverConnectorId, port: 18127, authenticationRequired: false, url: 'http://127.0.0.1:18127/api/v1/nist' }, telegram: telegramStatus, connectors: connectors.map(connectorSummary), inbox: [...inbox.values()].map(inboxSummary),
     });
+    if (!licensing.isValid()) return json(response, 423, { error: 'A valid HERTA Operations license is required.', license: licensing.getStatus() });
     if (request.method === 'POST' && url.pathname === '/api/session') {
       const body = JSON.parse((await readBody(request)).toString('utf8'));
       const base = new URL(String(body.baseUrl || ''));
@@ -646,12 +673,28 @@ async function main() {
   backupSettings.retentionCount = Math.max(1, Math.min(365, Math.floor(Number(backupSettings.retentionCount) || 30)));
   try { parseCron(backupSettings.cron); } catch { backupSettings = { ...backupSettings, enabled: false, cron: '0 2 * * *' }; }
   telegramConfig = await readJson(path.join(DATA_DIR, 'telegram-settings.json'), telegramConfig);
+  await licensing.start();
+  licensing.onChange = (valid, previouslyValid) => {
+    if (valid === previouslyValid || licensedServicesBusy) return;
+    licensedServicesBusy = true;
+    void (async () => {
+      try {
+        if (valid) await applyConnectors(connectors);
+        else {
+          activeBackupChild?.kill('SIGTERM');
+          await stopConnectorRuntimes();
+          for (const connector of connectors) if (connector.active) saveRuntime(connector.id, { status: 'license-required', lastError: 'License expired or could not be validated.' });
+        }
+      } catch (error) { console.error('License state transition failed:', error.message); }
+      finally { licensedServicesBusy = false; }
+    })();
+  };
   await applyConnectors(connectors);
   const server = http.createServer((request, response) => { void route(request, response); });
   server.listen(PORT, '0.0.0.0');
-  if (telegramConfig.botToken && telegramConfig.chatId) void checkTelegram().catch(() => {});
-  scheduler = setInterval(() => { void tickBackup(); if (session?.username) void hertaAuth.renew().catch(error => console.error("HERTA renewal:", error.message)); }, 5000);
-  const shutdown = async () => { clearInterval(scheduler); await stopKafka(); server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref(); };
+  if (licensing.isValid() && telegramConfig.botToken && telegramConfig.chatId) void checkTelegram().catch(() => {});
+  scheduler = setInterval(() => { void tickBackup(); if (licensing.isValid() && session?.username) void hertaAuth.renew().catch(error => console.error("HERTA renewal:", error.message)); }, 5000);
+  const shutdown = async () => { clearInterval(scheduler); licensing.stop(); await stopConnectorRuntimes(); server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref(); };
   process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
   console.log(`HERTA worker listening on ${PORT}`);
 }
