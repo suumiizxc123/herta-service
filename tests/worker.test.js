@@ -40,6 +40,9 @@ test('Docker worker exposes an authenticated status API and persists REST inbox 
   assert.equal((await settingsResponse.json()).retentionCount, 7);
   const status = await (await fetch(`${base}/api/status`, { headers: { Authorization: `Bearer ${apiToken}` } })).json();
   assert.equal(status.backup.retentionCount, 7);
+  assert.equal(status.kafka.listening, false);
+  assert.equal(status.receiver.running, false);
+  assert.equal(status.telegram.configured, false);
 
   const receiverResponse = await fetch(`${base}/api/receiver/start`, { method: 'POST', headers: controlHeaders, body: '{}' });
   const receiver = await receiverResponse.json();

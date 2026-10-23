@@ -39,6 +39,29 @@ let restReceiver = null;
 const defaultBackupSettings = () => ({ enabled: false, directory: '', cron: '0 2 * * *', retentionCount: 30 });
 
 function sessionFile() { return path.join(app.getPath('userData'), 'herta-session.enc'); }
+function connectorSettingsFile() { return path.join(app.getPath('userData'), 'connector-settings.enc'); }
+const defaultConnectorSettings = () => ({ rest: { url: '', bearerToken: '', verifyTls: true }, kafka: { brokers: 'localhost:9092', topic: 'herta.nist', groupId: 'herta-operations-desktop', tls: false, verifyTls: true, mechanism: 'none', username: '', password: '', messageFormat: 'json-base64', partitions: '1', replicationFactor: '1' }, telegram: { botToken: '', chatId: '' } });
+
+async function readConnectorSettings() {
+  const fallback = defaultConnectorSettings();
+  if (!await safeStorage.isAsyncEncryptionAvailable()) return fallback;
+  try {
+    const encrypted = await fs.readFile(connectorSettingsFile());
+    const decrypted = await safeStorage.decryptStringAsync(encrypted);
+    const saved = JSON.parse(decrypted.result);
+    return { ...fallback, ...saved, rest: { ...fallback.rest, ...saved.rest }, kafka: { ...fallback.kafka, ...saved.kafka }, telegram: { ...fallback.telegram, ...saved.telegram } };
+  } catch { return fallback; }
+}
+
+async function saveConnectorSettings(settings) {
+  if (!await safeStorage.isAsyncEncryptionAvailable()) throw new Error('Secure credential storage is unavailable on this computer.');
+  const defaults = defaultConnectorSettings();
+  const next = { rest: { ...defaults.rest, ...settings?.rest }, kafka: { ...defaults.kafka, ...settings?.kafka }, telegram: { ...defaults.telegram, ...settings?.telegram } };
+  const file = connectorSettingsFile(); await fs.mkdir(path.dirname(file), { recursive: true });
+  const encrypted = await safeStorage.encryptStringAsync(JSON.stringify(next));
+  const temporary = `${file}.tmp`; await fs.writeFile(temporary, encrypted, { mode: 0o600 }); await fs.rename(temporary, file);
+  return next;
+}
 
 async function persistHertaSession(session) {
   const destination = sessionFile();
@@ -743,6 +766,8 @@ function registerIpc() {
     if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);
     const settings = await readBackupSettings();
       if (status.worker?.ok) await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: settings.enabled, cron: settings.cron, retentionCount: settings.retentionCount } }).catch(() => {});
+    const connectors = await readConnectorSettings();
+    if (status.worker?.ok && connectors.telegram.botToken && connectors.telegram.chatId) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: connectors.telegram }).catch(() => {});
     return DockerPlatform.platformStatus(app);
   });
   handle('platform:stop', () => DockerPlatform.stopPlatform(app));
@@ -758,6 +783,22 @@ function registerIpc() {
     return DockerPlatform.workerRequest(app, endpoint[1], { method: endpoint[0], body: payload, timeout: operation === 'backupRun' ? 15 * 60 * 1000 : 30000 });
   });
   handle('herta:session', () => ({ authenticated: Boolean(hertaSession?.token), baseUrl: hertaSession?.baseUrl || '' }));
+  handle('connectors:settings', () => readConnectorSettings());
+  handle('connectors:settings-save', async (settings) => {
+    const saved = await saveConnectorSettings(settings);
+    const status = await DockerPlatform.platformStatus(app).catch(() => null);
+    if (status?.worker?.ok) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: saved.telegram }).catch(() => {});
+    return saved;
+  });
+  handle('connectors:telegram-status', async () => {
+    const status = await DockerPlatform.platformStatus(app);
+    return status.worker?.ok ? DockerPlatform.workerRequest(app, '/api/telegram/status') : { configured: false, connected: false, error: 'Start the Docker worker first.' };
+  });
+  handle('connectors:telegram-test', async () => {
+    const settings = await readConnectorSettings();
+    if (!settings.telegram.botToken || !settings.telegram.chatId) throw new Error('Enter and save the Telegram bot token and chat ID first.');
+    return DockerPlatform.workerRequest(app, '/api/telegram/test', { method: 'POST', body: {} });
+  });
   handle('herta:login', async ({ baseUrl, username, password, verifyTls }) => {
     if (!String(username || '').trim() || !String(password || '')) throw new Error('Enter your HERTA username and password.');
     const normalized = normalizeBaseUrl(baseUrl);
@@ -823,7 +864,10 @@ function registerIpc() {
   });
   handle('herta:backup', async (options) => {
     const status = await DockerPlatform.platformStatus(app).catch(() => null);
-    return status?.worker?.ok ? DockerPlatform.workerRequest(app, '/api/backup/run', { method: 'POST', body: {}, timeout: 15 * 60 * 1000 }) : createBackup(options);
+    if (!status?.worker?.ok) return createBackup(options);
+    const result = await DockerPlatform.workerRequest(app, '/api/backup/run', { method: 'POST', body: {}, timeout: 15 * 60 * 1000 });
+    const destination = status.backupPath || options?.directory || '';
+    return { ...result, path: destination ? path.join(destination, path.basename(result.path || '')) : result.path };
   });
   handle('herta:health', checkHertaHealth);
   handle('herta:audit', async () => {
@@ -931,7 +975,12 @@ function registerIpc() {
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
   registerIpc();
-    await restoreHertaSession();
+  await restoreHertaSession();
+  const initialStatus = await DockerPlatform.platformStatus(app).catch(() => null);
+  const initialConnectors = await readConnectorSettings();
+  if (initialStatus?.worker?.ok && initialConnectors.telegram.botToken && initialConnectors.telegram.chatId) {
+    await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: initialConnectors.telegram }).catch(() => {});
+  }
   await createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

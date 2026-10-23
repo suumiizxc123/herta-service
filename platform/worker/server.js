@@ -19,6 +19,8 @@ let session = null;
 let kafkaConsumer = null;
 let kafkaInfo = null;
 let receiverToken = '';
+let telegramConfig = { botToken: '', chatId: '' };
+let telegramStatus = { configured: false, connected: false, botName: '', checkedAt: null, lastError: '' };
 let backupSettings = { enabled: false, cron: '0 2 * * *', retentionCount: 30, lastScheduledKey: '', lastRunAt: null, lastRunStatus: 'idle', lastRunMessage: '' };
 let backupBusy = false;
 let scheduler;
@@ -61,7 +63,38 @@ async function addFiles(files, source, kafka = null) {
     inbox.set(id, { ...entry, data: item.data, file }); ids.push(id);
   }
   await saveInbox();
+  void sendTelegramMessage(`HERTA Operations received ${ids.length} NIST file${ids.length === 1 ? '' : 's'} from ${source}.`);
   return ids;
+}
+
+async function telegramRequest(method, body = {}) {
+  const response = await fetch(`https://api.telegram.org/bot${telegramConfig.botToken}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.ok) throw new Error(String(result.description || `Telegram API request failed (HTTP ${response.status}).`).slice(0, 240));
+  return result.result;
+}
+
+async function checkTelegram() {
+  if (!telegramConfig.botToken || !telegramConfig.chatId) throw new Error('Telegram bot token and chat ID are required.');
+  try {
+    const bot = await telegramRequest('getMe');
+    telegramStatus = { configured: true, connected: true, botName: bot.username || bot.first_name || 'Telegram bot', checkedAt: new Date().toISOString(), lastError: '' };
+    return telegramStatus;
+  } catch (error) {
+    telegramStatus = { ...telegramStatus, configured: true, connected: false, checkedAt: new Date().toISOString(), lastError: error.message };
+    throw error;
+  }
+}
+
+async function sendTelegramMessage(text) {
+  if (!telegramConfig.botToken || !telegramConfig.chatId) return;
+  try {
+    await telegramRequest('sendMessage', { chat_id: telegramConfig.chatId, text });
+    telegramStatus = { ...telegramStatus, configured: true, connected: true, checkedAt: new Date().toISOString(), lastError: '' };
+  } catch (error) {
+    telegramStatus = { ...telegramStatus, configured: true, connected: false, checkedAt: new Date().toISOString(), lastError: error.message };
+    console.error('Telegram notification failed:', error.message);
+  }
 }
 
 function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json } = {}) {
@@ -238,7 +271,7 @@ async function route(request, response) {
   if (!requireApi(request, response)) return;
   try {
     if (request.method === 'GET' && url.pathname === '/api/status') return json(response, 200, {
-      ok: true, service: 'herta-worker', startedAt, authenticated: Boolean(session?.token), backup: { enabled: backupSettings.enabled, cron: backupSettings.cron, retentionCount: backupSettings.retentionCount, nextRun: backupSettings.enabled ? nextCronDate(backupSettings.cron).toISOString() : null, running: backupBusy, lastRunAt: backupSettings.lastRunAt, lastRunStatus: backupSettings.lastRunStatus, lastRunMessage: backupSettings.lastRunMessage }, kafka: kafkaInfo || { listening: false }, receiver: { running: Boolean(receiverToken), port: 18127, token: receiverToken, url: 'http://127.0.0.1:18127/api/v1/nist' }, inbox: [...inbox.values()].map(inboxSummary),
+      ok: true, service: 'herta-worker', startedAt, authenticated: Boolean(session?.token), backup: { enabled: backupSettings.enabled, cron: backupSettings.cron, retentionCount: backupSettings.retentionCount, nextRun: backupSettings.enabled ? nextCronDate(backupSettings.cron).toISOString() : null, running: backupBusy, lastRunAt: backupSettings.lastRunAt, lastRunStatus: backupSettings.lastRunStatus, lastRunMessage: backupSettings.lastRunMessage }, kafka: kafkaInfo || { listening: false }, receiver: { running: Boolean(receiverToken), port: 18127, token: receiverToken, url: 'http://127.0.0.1:18127/api/v1/nist' }, telegram: telegramStatus, inbox: [...inbox.values()].map(inboxSummary),
     });
     if (request.method === 'POST' && url.pathname === '/api/session') {
       const body = JSON.parse((await readBody(request)).toString('utf8'));
@@ -250,6 +283,19 @@ async function route(request, response) {
     if (request.method === 'DELETE' && url.pathname === '/api/session') { session = null; return json(response, 200, { authenticated: false }); }
     if (request.method === 'POST' && url.pathname === '/api/receiver/start') { if (!receiverToken) receiverToken = crypto.randomBytes(32).toString('base64url'); return json(response, 200, { running: true, port: 18127, token: receiverToken, url: 'http://127.0.0.1:18127/api/v1/nist' }); }
     if (request.method === 'POST' && url.pathname === '/api/receiver/stop') { receiverToken = ''; return json(response, 200, { running: false }); }
+    if (request.method === 'GET' && url.pathname === '/api/telegram/status') return json(response, 200, telegramStatus);
+    if (request.method === 'POST' && url.pathname === '/api/telegram/config') {
+      const body = JSON.parse((await readBody(request)).toString('utf8'));
+      telegramConfig = { botToken: String(body.botToken || '').trim(), chatId: String(body.chatId || '').trim() };
+      if (!telegramConfig.botToken || !telegramConfig.chatId) { telegramConfig = { botToken: '', chatId: '' }; telegramStatus = { configured: false, connected: false, botName: '', checkedAt: new Date().toISOString(), lastError: '' }; return json(response, 200, telegramStatus); }
+      return json(response, 200, await checkTelegram());
+    }
+    if (request.method === 'POST' && url.pathname === '/api/telegram/test') {
+      await checkTelegram();
+      await telegramRequest('sendMessage', { chat_id: telegramConfig.chatId, text: 'HERTA Operations Telegram connector test succeeded.' });
+      telegramStatus = { ...telegramStatus, connected: true, checkedAt: new Date().toISOString(), lastError: '' };
+      return json(response, 200, { ...telegramStatus, sent: true });
+    }
     if (request.method === 'GET' && url.pathname === '/api/inbox') return json(response, 200, [...inbox.values()].map(inboxSummary));
     if (request.method === 'GET' && url.pathname === '/api/audit') return json(response, 200, await readJson(path.join(DATA_DIR, 'activity-log.json'), []));
     if (request.method === 'GET' && url.pathname.startsWith('/api/inbox/') && url.pathname.endsWith('/content')) {
