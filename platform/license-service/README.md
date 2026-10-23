@@ -12,7 +12,7 @@ This separate Node service issues and validates license keys for the Docker work
    [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
    ```
 
-4. Deploy `herta-license-service`. The Blueprint uses a paid 0.5 CPU / 512 MB web service with a 1 GB persistent disk at `/var/data`, so issued and revoked keys survive deploys and restarts. Render Free web services cannot attach a disk and can spin down; they are not suitable for this license registry.
+4. Deploy `herta-license-service` on the Free plan. This is for testing only: Free services can spin down and have ephemeral storage, so issued and revoked keys can be lost after a restart, sleep, or deploy. Do not use this configuration for production licensing. Move to a paid service with a persistent disk before relying on issued keys.
 5. Copy its HTTPS URL, for example `https://herta-license-service.onrender.com`.
 
 The service exposes `/health`, `POST /v1/validate`, and admin-only license issue/list/revoke endpoints. It does not provide an admin web page, so use the PowerShell commands below.
