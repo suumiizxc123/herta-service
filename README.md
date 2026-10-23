@@ -1,4 +1,4 @@
-# HERTA Operations Desktop 1.9.2
+# HERTA Operations Desktop 1.9.5
 
 Electron is the control interface. A Docker Compose worker handles REST intake, Kafka consumption, the persistent review inbox, and scheduled NIST ZIP backups independently of the Electron window. Windows requires Docker Desktop with its engine running; install/start Docker Desktop before using **Start workers** on the Overview page.
 

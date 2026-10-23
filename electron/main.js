@@ -519,7 +519,7 @@ async function startKafkaSource(input) {
         } else {
           let payload;
           try { payload = JSON.parse(Buffer.from(message.value || []).toString('utf8')); }
-          catch { throw new Error('Kafka message is not valid JSON.'); }
+          catch { throw new Error('This message is not valid JSON. Expected a JSON NIST envelope with a Base64 fileContent field. If the topic contains raw NIST bytes, change Message format to “Raw NIST bytes”.'); }
           files = normalizeNistSourcePayload(payload);
         }
         const ids = addSourceFiles(files, `Kafka · ${topic}`, { topic, partition, offset: message.offset });
@@ -624,12 +624,13 @@ async function prepareImport(ids) {
   let total = 0;
   for (const file of files) {
     const size = file.data !== undefined ? file.data.length : (await fs.stat(file.path)).size;
-    if (!file.name.toLowerCase().endsWith('.nist')) {
-      rows.push({ File: file.name, Code: file.name, Status: 'Rejected', Bytes: size, Message: 'Only .nist files are accepted.' });
+    const code = path.parse(file.name).name || file.name;
+    if (size === 0) {
+      rows.push({ File: file.name, Code: code, Status: 'Rejected', Bytes: size, Message: 'File is empty.' });
     } else if (size > MAX_FILE_BYTES) {
-      rows.push({ File: file.name, Code: file.name.slice(0, -5), Status: 'Rejected', Bytes: size, Message: 'File exceeds 32 MiB.' });
+      rows.push({ File: file.name, Code: code, Status: 'Rejected', Bytes: size, Message: 'File exceeds 32 MiB.' });
     } else if (total + size > MAX_BATCH_BYTES) {
-      rows.push({ File: file.name, Code: file.name.slice(0, -5), Status: 'Rejected', Bytes: size, Message: 'Batch exceeds 256 MiB.' });
+      rows.push({ File: file.name, Code: code, Status: 'Rejected', Bytes: size, Message: 'Batch exceeds 256 MiB.' });
     } else {
       accepted.push({ ...file, size });
       total += size;
@@ -643,7 +644,7 @@ async function runImport({ ids, group = '0', confirmation = '' }) {
   if (confirmation !== 'IMPORT') throw new Error('Type IMPORT to confirm sending biometric data to HERTA.');
   const { accepted, rows } = await prepareImport(ids);
   for (const file of accepted) {
-    const row = { File: file.name, Code: file.name.slice(0, -5), Status: 'Failed', HttpStatus: '', Bytes: file.size, Message: '' };
+    const row = { File: file.name, Code: path.parse(file.name).name || file.name, Status: 'Failed', HttpStatus: '', Bytes: file.size, Message: '' };
     try {
       const data = file.data !== undefined ? file.data : await fs.readFile(file.path);
       const response = await requestJson(session.baseUrl, session.verifyTls, '/api/v1/subjects/import', {
@@ -866,9 +867,12 @@ function registerIpc() {
   handle('source:rest-receiver-stop', () => DockerPlatform.workerRequest(app, '/api/receiver/stop', { method: 'POST', body: {} }));
   handle('files:pick-import', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: 'Choose HERTA NIST files',
+      title: 'Choose NIST / ANSI-NIST files from any source',
       properties: ['openFile', 'multiSelections'],
-      filters: [{ name: 'NIST files', extensions: ['nist'] }],
+      filters: [
+        { name: 'NIST / ANSI-NIST files', extensions: ['nist', 'an2', 'anf', 'eft', 'dat', 'xml', 'txt'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
     });
     if (result.canceled) return [];
     selectedFiles.clear();
@@ -912,7 +916,7 @@ function registerIpc() {
     const { accepted, rows } = await prepareImport(ids);
     rows.push(...accepted.map((file) => ({
       File: file.name,
-      Code: file.name.slice(0, -5),
+      Code: path.parse(file.name).name || file.name,
       Status: 'DryRun',
       Bytes: file.size,
       Message: `Not sent to HERTA. Group: ${String(group)}.`,

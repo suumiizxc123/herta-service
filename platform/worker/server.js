@@ -44,7 +44,7 @@ async function saveInbox() {
   const entries = [...inbox.values()].map(({ data, file, ...entry }) => ({ ...entry, ...(file ? { file: path.basename(file) } : {}) }));
   await writeJson(path.join(DATA_DIR, 'inbox.json'), entries);
 }
-function inboxSummary(entry) { return { id: entry.id, name: entry.name, size: entry.data?.length || 0, source: entry.source, error: entry.error || '', kafka: entry.kafka || null }; }
+function inboxSummary(entry) { return { id: entry.id, name: entry.name, size: entry.data?.length || 0, source: entry.source, error: entry.error || '', kafka: entry.kafka || null, createdAt: entry.createdAt || null }; }
 
 async function addFiles(files, source, kafka = null) {
   if (inbox.size + files.length > 500) throw new Error('The worker inbox is limited to 500 files.');
@@ -188,7 +188,12 @@ async function startKafka(input) {
     try {
       let files;
       if (config.messageFormat === 'raw-nist') files = [{ name: safeNistName(message.key?.toString() || `${topic}-${partition}-${message.offset}`), data: Buffer.from(message.value || []) }];
-      else files = normalizeNistSourcePayload(JSON.parse(Buffer.from(message.value || []).toString('utf8')));
+      else {
+        let payload;
+        try { payload = JSON.parse(Buffer.from(message.value || []).toString('utf8')); }
+        catch { throw new Error('This message is not valid JSON. Expected a JSON NIST envelope with a Base64 fileContent field. If the topic contains raw NIST bytes, change Message format to “Raw NIST bytes”.'); }
+        files = normalizeNistSourcePayload(payload);
+      }
       await addFiles(files, `Kafka · ${topic}`, { topic, partition, offset: message.offset });
     } catch (error) {
       const id = crypto.randomUUID(); inbox.set(id, { id, name: `${topic}-${partition}-${message.offset}`, size: 0, source: `Kafka · ${topic}`, kafka: { topic, partition, offset: message.offset }, error: error.message, createdAt: new Date().toISOString() }); await saveInbox();

@@ -25,7 +25,9 @@ function composeDirectory(app) {
 function run(command, args, { cwd, timeout = 120000 } = {}) {
   return new Promise((resolve, reject) => {
     const executable = command === 'docker' ? dockerCommand() : command;
-    const child = spawn(executable, args, { cwd, windowsHide: true, shell: false, env: { ...process.env, DOCKER_CLI_HINTS: 'false' } });
+    const binaryDirectory = path.isAbsolute(executable) ? path.dirname(executable) : '';
+    const childPath = binaryDirectory ? `${binaryDirectory}${path.delimiter}${process.env.PATH || ''}` : process.env.PATH;
+    const child = spawn(executable, args, { cwd, windowsHide: true, shell: false, env: { ...process.env, PATH: childPath, DOCKER_CLI_HINTS: 'false' } });
     let stdout = ''; let stderr = ''; let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
     child.stdout.on('data', (chunk) => { stdout += chunk; if (stdout.length > 2_000_000) child.kill(); });
@@ -107,7 +109,7 @@ async function startPlatform(app, options = {}) {
   const services = ['herta-worker'];
   if (options.localKafka) services.push('kafka');
   if (options.search) services.push('elasticsearch');
-  await run('docker', composeArgs(app, env.file, ['up', '-d', ...services]), { cwd: composeDirectory(app), timeout: 15 * 60 * 1000 });
+  await run('docker', composeArgs(app, env.file, ['up', '-d', '--build', ...services]), { cwd: composeDirectory(app), timeout: 15 * 60 * 1000 });
   const running = (name) => before.services.some((service) => service.Service === name && /running|up/i.test(service.State || service.Status || ''));
   for (const [name, enabled] of [['kafka', Boolean(options.localKafka)], ['elasticsearch', Boolean(options.search)]]) {
     if (!enabled && running(name)) await run('docker', composeArgs(app, env.file, ['stop', name]), { cwd: composeDirectory(app), timeout: 120000 });

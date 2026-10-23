@@ -3,7 +3,7 @@ import {
   Activity, ArrowDownToLine, ArrowRight, ArchiveRestore, CheckCircle2, CircleHelp,
   Cloud, Database, FileArchive, FileCheck2, Fingerprint, FolderOpen, HeartPulse,
   Eye, History, LayoutDashboard, LoaderCircle, LogOut, Pause, Play, Plus, Radio, ChevronLeft, ChevronRight, UserRound,
-  RefreshCw, Search, Server, ShieldCheck, Upload, Users, X,
+  RefreshCw, Search, Server, ShieldCheck, Trash2, Upload, Users, X,
 } from 'lucide-react';
 import { Badge } from './components/ui/badge.jsx';
 import { Button } from './components/ui/button.jsx';
@@ -15,14 +15,16 @@ import { Separator } from './components/ui/separator.jsx';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table.jsx';
 
 const navItems = [
-  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+  { id: 'overview', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'subjects', label: 'Subjects', icon: Users },
+  { id: 'export', label: 'NIST export', icon: ArrowDownToLine },
   { id: 'import', label: 'NIST import', icon: Upload },
+  { id: 'rest', label: 'REST API', icon: Cloud },
+  { id: 'kafka', label: 'Kafka', icon: Radio },
   { id: 'profiles', label: 'Profile check', icon: Fingerprint },
   { id: 'backups', label: 'Backup & restore', icon: ArchiveRestore },
   { id: 'health', label: 'System health', icon: HeartPulse },
   { id: 'activity', label: 'Audit activity', icon: History },
-  { id: 'integrations', label: 'Integrations', icon: Radio },
 ];
 const titleFor = Object.fromEntries(navItems.map(({ id, label }) => [id, label]));
 const formatSize = (size = 0) => size < 1024 * 1024 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 / 1024).toFixed(2)} MB`;
@@ -66,6 +68,8 @@ export default function App() {
   const [kafkaListening, setKafkaListening] = useState(false);
   const [sourceInbox, setSourceInbox] = useState([]);
   const [inboxSelection, setInboxSelection] = useState(() => new Set());
+  const [expandedInboxError, setExpandedInboxError] = useState('');
+  const [inboxBusy, setInboxBusy] = useState(false);
   const [receiver, setReceiver] = useState({ running: false, port: '8006', token: '' });
   const [integrationMessage, setIntegrationMessage] = useState('');
   const [backupSettings, setBackupSettings] = useState({ enabled: false, directory: '', cron: '0 2 * * *', retentionCount: 30 });
@@ -122,7 +126,7 @@ export default function App() {
   }, [invoke, loadSubjects]);
 
   useEffect(() => {
-    if (view !== 'subjects' || !session.authenticated) return undefined;
+    if (!['subjects', 'export'].includes(view) || !session.authenticated) return undefined;
     const timer = window.setTimeout(() => loadSubjects(subjectQuery, subjectGroup, subjectPage).catch(() => {}), 250);
     return () => window.clearTimeout(timer);
   }, [subjectQuery, subjectGroup, subjectPage, view, session.authenticated, loadSubjects]);
@@ -287,7 +291,11 @@ export default function App() {
   }, [invoke, notify]);
 
   const refreshInbox = useCallback(async () => {
-    try { setSourceInbox(await invoke('getSourceInbox')); }
+    try {
+      const items = await invoke('getSourceInbox');
+      setSourceInbox(items);
+      setInboxSelection((current) => new Set([...current].filter((id) => items.some((item) => item.id === id))));
+    }
     catch (error) { setIntegrationMessage(error.message); }
   }, [invoke]);
 
@@ -324,12 +332,12 @@ export default function App() {
   useEffect(() => {
     if (view === 'health' || view === 'overview') refreshHealth();
     if (view === 'activity' || view === 'backups' || view === 'overview') refreshAudit();
-    if (view === 'integrations' || view === 'overview') refreshInbox();
+    if (view === 'rest' || view === 'kafka' || view === 'overview') refreshInbox();
     if (view === 'overview') refreshPlatform();
   }, [view, refreshHealth, refreshAudit, refreshInbox, refreshPlatform]);
 
   useEffect(() => {
-    if (view !== 'integrations') return undefined;
+    if (view !== 'rest' && view !== 'kafka') return undefined;
     const timer = window.setInterval(refreshInbox, 1800);
     return () => window.clearInterval(timer);
   }, [view, refreshInbox]);
@@ -374,14 +382,33 @@ export default function App() {
 
   const loadReceived = async () => {
     setLoading(true);
-    try { const result = await invoke('loadInboxFiles', [...inboxSelection]); setFiles(result); setImportRows([]); setImportExecuted(false); setRestoreSource(false); setView('import'); notify(`${result.length} received NIST file${result.length === 1 ? '' : 's'} ready to preview.`); }
+    const validIds = [...inboxSelection].filter((id) => sourceInbox.some((item) => item.id === id && !item.error));
+    try { const result = await invoke('loadInboxFiles', validIds); setFiles(result); setImportRows([]); setImportExecuted(false); setRestoreSource(false); setView('import'); notify(`${result.length} received NIST file${result.length === 1 ? '' : 's'} ready to preview.`); }
     catch (error) { notify(error.message, true); }
     finally { setLoading(false); }
   };
 
   const discardInboxItem = async (id) => {
-    try { await invoke('discardInboxItem', id); await refreshInbox(); }
+    try { await invoke('discardInboxItem', id); setInboxSelection((current) => { const next = new Set(current); next.delete(id); return next; }); await refreshInbox(); notify('Inbox item removed.'); }
     catch (error) { setIntegrationMessage(error.message); }
+  };
+
+  const selectInboxItems = (mode) => {
+    if (!mode) return;
+    const matches = sourceInbox.filter((item) => mode === 'all' || (mode === 'valid' && !item.error) || (mode === 'errors' && item.error));
+    setInboxSelection(mode === 'clear' ? new Set() : new Set(matches.map((item) => item.id)));
+  };
+
+  const discardSelectedInbox = async () => {
+    if (!inboxSelection.size) return;
+    setInboxBusy(true);
+    try {
+      for (const id of inboxSelection) await invoke('discardInboxItem', id);
+      setInboxSelection(new Set());
+      await refreshInbox();
+      notify('Selected inbox items removed.');
+    } catch (error) { setIntegrationMessage(error.message); }
+    finally { setInboxBusy(false); }
   };
 
   const startReceiver = async () => {
@@ -398,13 +425,13 @@ export default function App() {
 
   const selectedAll = subjects.length > 0 && subjects.every((subject) => selected.has(subject.code));
   const lastSnapshot = auditEvents.find((event) => ['Snapshot created', 'Automatic snapshot created'].includes(event.action));
-  const headerAction = view === 'subjects' ? <Button variant="outline" onClick={exportSelected} disabled={loading || !selected.size}><ArrowDownToLine /> Export {selected.size || ''}</Button>
+  const headerAction = view === 'subjects' || view === 'export' ? <Button onClick={exportSelected} disabled={loading || !selected.size}><ArrowDownToLine /> Export selected {selected.size ? `(${selected.size})` : ''}</Button>
     : view === 'import' ? <Button onClick={chooseFiles}><FolderOpen /> Choose files</Button>
       : view === 'profiles' ? <Button onClick={runProfileCheck} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <RefreshCw />} Run check</Button>
         : view === 'backups' ? <Button onClick={createSnapshot} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <ArchiveRestore />} Create snapshot</Button>
           : view === 'health' ? <Button variant="outline" onClick={refreshHealth}><RefreshCw /> Check now</Button>
               : view === 'activity' ? <Button variant="outline" onClick={refreshAudit}><RefreshCw /> Refresh log</Button>
-              : view === 'integrations' ? <Button variant="outline" onClick={refreshInbox}><RefreshCw /> Refresh inbox</Button>
+              : view === 'rest' || view === 'kafka' ? <Button variant="outline" onClick={refreshInbox}><RefreshCw /> Refresh inbox</Button>
               : <Button variant="outline" onClick={() => loadSubjects().catch(() => {})} disabled={loading}><RefreshCw className={loading ? 'animate-spin' : ''} /> Refresh</Button>;
 
   const dashboardStats = useMemo(() => ({
@@ -432,7 +459,7 @@ export default function App() {
           <p className="mt-2 truncate text-[11px] text-slate-500" title={session.baseUrl}>{session.baseUrl}</p>
         </div>
         <Button variant="ghost" className="mt-3 w-full justify-start text-slate-600 hover:bg-slate-100 hover:text-slate-900" onClick={signOut}><LogOut /> Sign out</Button>
-        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.8.0'}</div>
+        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.9.6'}</div>
       </div>
     </aside>
 
@@ -444,7 +471,7 @@ export default function App() {
 
       <div key={view} className="page-transition mx-auto max-w-[1320px] px-8 py-8">
         {view === 'overview' && <>
-          <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">Operations center</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">System overview</h1><p className="mt-1 text-sm text-muted-foreground">Live status of this desktop, its HERTA connection, data intake, and backups.</p></div><div className="flex items-center gap-2"><Badge variant="outline" className={`gap-1.5 px-3 py-1.5 ${health?.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : healthError ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}><span className={`size-1.5 rounded-full ${health?.ok ? 'bg-emerald-500' : healthError ? 'bg-rose-500' : 'bg-amber-500'}`} />{health?.ok ? 'HERTA healthy' : healthError ? 'HERTA unavailable' : 'Checking HERTA'}</Badge><Button variant="outline" size="sm" onClick={() => { refreshHealth(); refreshAudit(); refreshInbox(); }}><RefreshCw className="size-3.5" /> Refresh</Button></div></div>
+          <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">Operations center</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">Dashboard</h1><p className="mt-1 text-sm text-muted-foreground">See the service status and jump straight into your daily tasks.</p></div><div className="flex items-center gap-2"><Badge variant="outline" className={`gap-1.5 px-3 py-1.5 ${health?.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : healthError ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}><span className={`size-1.5 rounded-full ${health?.ok ? 'bg-emerald-500' : healthError ? 'bg-rose-500' : 'bg-amber-500'}`} />{health?.ok ? 'HERTA healthy' : healthError ? 'HERTA unavailable' : 'Checking HERTA'}</Badge><Button variant="outline" size="sm" onClick={() => { refreshHealth(); refreshAudit(); refreshInbox(); refreshPlatform(); }}><RefreshCw className="size-3.5" /> Refresh</Button></div></div>
 
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <DashboardMetric icon={HeartPulse} label="HERTA API" value={health?.ok ? `${health.latencyMs} ms` : healthError ? 'Unavailable' : 'Checking…'} detail={health?.ok ? 'Latest response time' : healthError ? 'Check connection settings' : 'Running health check'} tone={health?.ok ? 'green' : healthError ? 'red' : 'amber'} />
@@ -490,14 +517,16 @@ export default function App() {
             </CardContent></Card>
           </div>
 
+          <Card className="mt-5 border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Quick actions</CardTitle><CardDescription className="mt-1">Open the task you need.</CardDescription></CardHeader><CardContent className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-4"><ActionTile icon={Users} title="Browse subjects" description={`${serverCount.toLocaleString()} HERTA records`} onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} /><ActionTile icon={ArrowDownToLine} title="Export NIST" description="Select records and save files" onClick={() => { setView('export'); loadSubjects().catch(() => {}); }} /><ActionTile icon={Upload} title="Import NIST" description={`${files.length} file(s) in the queue`} onClick={() => setView('import')} /><ActionTile icon={Cloud} title="REST API" description="Fetch or receive NIST data" onClick={() => setView('rest')} /></CardContent></Card>
+
           <div className="mt-5 grid gap-5 xl:grid-cols-[1.2fr_.8fr]">
             <Card className="border-slate-200/80 shadow-sm"><CardHeader className="flex-row items-center justify-between space-y-0 border-b bg-white px-5 py-4"><div><CardTitle className="text-base">Recent activity</CardTitle><CardDescription className="mt-1">Latest locally recorded operations.</CardDescription></div><Button variant="ghost" size="sm" onClick={() => setView('activity')}>View audit log <ArrowRight /></Button></CardHeader><CardContent className="p-5">{auditEvents.length ? <div className="space-y-3">{auditEvents.slice(0, 4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3"><span className="mt-1 flex size-7 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500"><Activity className="size-3.5" /></span><div className="min-w-0 flex-1"><div className="text-xs font-medium text-slate-800">{event.action}</div><div className="mt-0.5 truncate text-[10px] text-slate-500">{event.summary || 'Operation recorded'}</div></div><time className="shrink-0 text-[10px] text-slate-400">{new Date(event.at).toLocaleString()}</time></div>)}</div> : <div className="rounded-lg border border-dashed py-7 text-center text-xs text-slate-500">No recent activity recorded on this desktop.</div>}</CardContent></Card>
-            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Go to work</CardTitle><CardDescription className="mt-1">Open a workspace without hunting through menus.</CardDescription></CardHeader><CardContent className="grid gap-2 p-4 sm:grid-cols-2 xl:grid-cols-1"><ActionTile icon={Users} title="Subjects" description={`${serverCount.toLocaleString()} records · groups and profiles`} onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} /><ActionTile icon={Radio} title="Integrations" description="REST, Kafka, and incoming file inbox" onClick={() => setView('integrations')} /><ActionTile icon={Upload} title="Import NIST" description={`${files.length} file(s) currently in the import queue`} onClick={() => setView('import')} /></CardContent></Card>
+            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Service activity</CardTitle><CardDescription className="mt-1">Intake, backups, and HERTA connection at a glance.</CardDescription></CardHeader><CardContent className="space-y-3 p-5"><div className="flex items-center justify-between rounded-lg border px-3 py-2.5 text-xs"><span className="text-slate-600">REST receiver</span><Badge variant="secondary" className={receiver.running ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}>{receiver.running ? `Listening · ${receiver.port}` : 'Stopped'}</Badge></div><div className="flex items-center justify-between rounded-lg border px-3 py-2.5 text-xs"><span className="text-slate-600">Kafka consumer</span><Badge variant="secondary" className={kafkaListening ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}>{kafkaListening ? 'Receiving' : 'Stopped'}</Badge></div><Button variant="outline" className="w-full" onClick={() => setView('rest')}><Cloud /> Open REST API workspace <ArrowRight /></Button><Button variant="outline" className="w-full" onClick={() => setView('kafka')}><Radio /> Open Kafka settings <ArrowRight /></Button></CardContent></Card>
           </div>
         </>}
 
-        {view === 'subjects' && <>
-          <PageHeading eyebrow="HERTA directory" title="Subjects" description="Browse records by group, find a person by code, and open the full record." action={<Badge variant="outline" className="rounded-full bg-white px-3 py-1.5 text-slate-600">{serverCount.toLocaleString()} records</Badge>} />
+        {(view === 'subjects' || view === 'export') && <>
+          <PageHeading eyebrow={view === 'export' ? 'Download data' : 'HERTA directory'} title={view === 'export' ? 'Export NIST files' : 'Subjects'} description={view === 'export' ? 'Choose subjects below, then use Export selected to save NIST files and a CSV report.' : 'Browse records by group, find a person by code, and open the full record.'} action={<Badge variant="outline" className="rounded-full bg-white px-3 py-1.5 text-slate-600">{serverCount.toLocaleString()} records</Badge>} />
           <div className="mb-5 grid gap-3 sm:grid-cols-3">
             <Card className="border-slate-200/80"><CardContent className="flex items-center gap-3 p-4"><div className="flex size-10 items-center justify-center rounded-xl bg-blue-50 text-blue-700"><Users className="size-5" /></div><div><div className="text-xl font-semibold">{serverCount.toLocaleString()}</div><div className="text-xs text-muted-foreground">All HERTA subjects</div></div></CardContent></Card>
             <Card className="border-slate-200/80"><CardContent className="flex items-center gap-3 p-4"><div className="flex size-10 items-center justify-center rounded-xl bg-violet-50 text-violet-700"><FolderOpen className="size-5" /></div><div><div className="text-xl font-semibold">{subjectGroups.length}</div><div className="text-xs text-muted-foreground">Groups discovered</div></div></CardContent></Card>
@@ -515,11 +544,11 @@ export default function App() {
         </>}
 
         {view === 'import' && <>
-          <PageHeading eyebrow={restoreSource ? 'Recovery' : 'Data transfer'} title={restoreSource ? 'Restore snapshot' : 'NIST import'} description={restoreSource ? 'Review the selected backup files, then confirm the restore to HERTA.' : 'Select files, preview the batch, then confirm before sending it to HERTA.'} />
+          <PageHeading eyebrow={restoreSource ? 'Recovery' : 'Data transfer'} title={restoreSource ? 'Restore snapshot' : 'NIST / ANSI-NIST import'} description={restoreSource ? 'Review the selected backup files, then confirm the restore to HERTA.' : 'Import NIST transaction files from HERTA or another source. The HERTA server checks whether it supports the file variant.'} />
           <div className="grid gap-5 xl:grid-cols-[1fr_310px]">
             <div className="space-y-5">
-              <Card><CardHeader><CardTitle className="text-base">Select files</CardTitle><CardDescription>Choose one or more .nist files using the native file picker.</CardDescription></CardHeader><CardContent>
-                <button onClick={chooseFiles} className="flex min-h-[165px] w-full flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50/50 transition-colors hover:border-[#7f9ab6] hover:bg-[#f7fafc]"><div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><FolderOpen className="size-5" /></div><span className="text-sm font-medium">Choose NIST files</span><span className="mt-1 text-xs text-muted-foreground">Files stay on this computer until you run the import</span></button>
+              <Card><CardHeader><CardTitle className="text-base">Select NIST files</CardTitle><CardDescription>Choose .nist, .an2, .eft, .dat, or another NIST transaction file. The source system does not need to be HERTA.</CardDescription></CardHeader><CardContent>
+                <button onClick={chooseFiles} className="flex min-h-[165px] w-full flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50/50 transition-colors hover:border-[#7f9ab6] hover:bg-[#f7fafc]"><div className="mb-3 flex size-11 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><FolderOpen className="size-5" /></div><span className="text-sm font-medium">Choose NIST files</span><span className="mt-1 text-xs text-muted-foreground">Select standard NIST files with any extension · HERTA validates the file format</span></button>
                 {!!files.length && <div className="mt-4 space-y-2">{files.map((file) => <div key={file.id} className="flex items-center gap-3 rounded-lg border px-3 py-2.5"><FileCheck2 className="size-4 shrink-0 text-[#6385a5]" /><div className="min-w-0 flex-1"><div className="truncate text-sm font-medium">{file.name}</div><div className="mt-0.5 text-xs text-muted-foreground">{formatSize(file.size)}</div></div><Button variant="ghost" size="icon" aria-label={`Remove ${file.name}`} onClick={() => setFiles((current) => current.filter((entry) => entry.id !== file.id))}><X className="size-4" /></Button></div>)}</div>}
               </CardContent></Card>
               {importRows.length > 0 && <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Import results</CardTitle><CardDescription className="mt-1">{importRows.length} file{importRows.length === 1 ? '' : 's'} · {importExecuted ? 'sent to HERTA' : 'preview only'}</CardDescription></div><Button variant="outline" size="sm" onClick={saveImportReport}><ArrowDownToLine /> Save report</Button></CardHeader><CardContent className="pt-0"><ImportTable rows={importRows} /></CardContent></Card>}
@@ -563,17 +592,53 @@ export default function App() {
           <Card className="mt-5"><CardHeader><CardTitle className="text-base">Server-side platform services</CardTitle><CardDescription>These components run beside the HERTA server; the desktop app does not install or host them.</CardDescription></CardHeader><CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{['Database connectors', 'Debezium CDC', 'Kafka messaging', 'Redis cache', 'Elasticsearch', 'MinIO / S3 storage', 'Prometheus / Grafana', 'Keycloak / notifications'].map((item) => <div key={item} className="flex items-center gap-2 rounded-lg border bg-white px-3 py-2.5 text-xs text-muted-foreground"><Database className="size-4 text-slate-400" />{item}<Badge variant="outline" className="ml-auto shrink-0 text-[10px]">Server-side</Badge></div>)}</CardContent></Card>
         </>}
 
-        {view === 'integrations' && <>
-          <PageHeading eyebrow="Sources" title="REST & Kafka integrations" description="Connect NIST sources, create topics in an existing Kafka cluster, or receive REST uploads into a reviewable import queue." />
+        {(view === 'rest' || view === 'kafka') && <>
+          <PageHeading eyebrow={view === 'rest' ? 'Data source · REST' : 'Data source · Kafka'} title={view === 'rest' ? 'REST API' : 'Kafka'} description={view === 'rest' ? 'Fetch NIST data from any API URL, or start a receiver so another system can POST NIST files into this app.' : 'Connect to an existing Kafka broker, test it, create a topic, and control the NIST consumer.'} />
           {integrationMessage && <div role="status" className={`mb-5 rounded-lg border px-4 py-3 text-sm ${/failed|could not|invalid|must|error|limit|enter/i.test(integrationMessage) ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-sky-200 bg-sky-50 text-sky-900'}`}>{integrationMessage}</div>}
           <div className="grid gap-5 xl:grid-cols-2">
-            <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Cloud className="size-5" /></div><CardTitle className="text-base">Connect a REST NIST source</CardTitle><CardDescription>Read from any JSON endpoint that returns Base64 NIST files.</CardDescription></CardHeader><CardContent className="space-y-3"><div><label className="mb-1.5 block text-xs font-medium">REST URL</label><Input value={restSource.url} onChange={(event) => setRestSource((current) => ({ ...current, url: event.target.value }))} placeholder="https://source.example/api/nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Bearer token <span className="font-normal text-muted-foreground">(optional; memory only)</span></label><Input type="password" autoComplete="off" value={restSource.bearerToken} onChange={(event) => setRestSource((current) => ({ ...current, bearerToken: event.target.value }))} placeholder="API token" /></div><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={restSource.verifyTls} onCheckedChange={(checked) => setRestSource((current) => ({ ...current, verifyTls: Boolean(checked) }))} /> Verify TLS certificate</label><div className="rounded-lg border bg-slate-50/70 p-3 text-xs leading-5 text-muted-foreground">Expected response: <code>{'{ "files": [{ "code": "SUB001", "fileContent": "BASE64_NIST" }] }'}</code>. Received files stay in memory until imported or discarded.</div><Button onClick={fetchRest} disabled={loading || !restSource.url.trim()}>{loading ? <LoaderCircle className="animate-spin" /> : <ArrowDownToLine />} Fetch NIST files</Button></CardContent></Card>
+            {view === 'rest' && <>
+            <Card id="rest-fetch"><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Cloud className="size-5" /></div><CardTitle className="text-base">Fetch data from a REST URL</CardTitle><CardDescription>Enter an API URL to pull NIST files into the review inbox.</CardDescription></CardHeader><CardContent className="space-y-3"><div><label className="mb-1.5 block text-xs font-medium">REST URL</label><Input value={restSource.url} onChange={(event) => setRestSource((current) => ({ ...current, url: event.target.value }))} placeholder="https://source.example/api/nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Bearer token <span className="font-normal text-muted-foreground">(optional; memory only)</span></label><Input type="password" autoComplete="off" value={restSource.bearerToken} onChange={(event) => setRestSource((current) => ({ ...current, bearerToken: event.target.value }))} placeholder="API token" /></div><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={restSource.verifyTls} onCheckedChange={(checked) => setRestSource((current) => ({ ...current, verifyTls: Boolean(checked) }))} /> Verify TLS certificate</label><div className="rounded-lg border bg-slate-50/70 p-3 text-xs leading-5 text-muted-foreground">API response format: <code>{'{ "files": [{ "code": "SUB001", "fileContent": "BASE64_NIST" }] }'}</code>. The fetched files appear in the inbox below.</div><Button onClick={fetchRest} disabled={loading || !restSource.url.trim()}>{loading ? <LoaderCircle className="animate-spin" /> : <ArrowDownToLine />} Fetch NIST files</Button></CardContent></Card>
+            </>}
 
-            <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Radio className="size-5" /></div><CardTitle className="text-base">Kafka source</CardTitle><CardDescription>Connect to a Kafka cluster. Topic creation requires an existing, reachable broker.</CardDescription></CardHeader><CardContent className="space-y-3"><div><label className="mb-1.5 block text-xs font-medium">Bootstrap brokers</label><Input value={kafkaSource.brokers} onChange={(event) => setKafkaSource((current) => ({ ...current, brokers: event.target.value }))} placeholder="broker1:9092,broker2:9092" /></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">Topic</label><Input value={kafkaSource.topic} onChange={(event) => setKafkaSource((current) => ({ ...current, topic: event.target.value }))} placeholder="herta.nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Consumer group</label><Input value={kafkaSource.groupId} onChange={(event) => setKafkaSource((current) => ({ ...current, groupId: event.target.value }))} /></div></div><div><label className="mb-1.5 block text-xs font-medium">Message format</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={kafkaSource.messageFormat} onChange={(event) => setKafkaSource((current) => ({ ...current, messageFormat: event.target.value }))}><option value="json-base64">JSON with Base64 NIST fileContent</option><option value="raw-nist">Raw NIST bytes</option></select></div><div className="grid gap-3 sm:grid-cols-2"><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={kafkaSource.tls} onCheckedChange={(checked) => setKafkaSource((current) => ({ ...current, tls: Boolean(checked) }))} /> Use TLS</label><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={kafkaSource.verifyTls} onCheckedChange={(checked) => setKafkaSource((current) => ({ ...current, verifyTls: Boolean(checked) }))} /> Verify certificate</label></div><div className="grid gap-3 sm:grid-cols-3"><div className="sm:col-span-1"><label className="mb-1.5 block text-xs font-medium">SASL</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={kafkaSource.mechanism} onChange={(event) => setKafkaSource((current) => ({ ...current, mechanism: event.target.value }))}><option value="none">None</option><option value="plain">PLAIN</option><option value="scram-sha-256">SCRAM-256</option><option value="scram-sha-512">SCRAM-512</option></select></div><Input className="self-end" disabled={kafkaSource.mechanism === 'none'} value={kafkaSource.username} onChange={(event) => setKafkaSource((current) => ({ ...current, username: event.target.value }))} placeholder="SASL username" /><Input className="self-end" type="password" autoComplete="off" disabled={kafkaSource.mechanism === 'none'} value={kafkaSource.password} onChange={(event) => setKafkaSource((current) => ({ ...current, password: event.target.value }))} placeholder="SASL password" /></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">New topic partitions</label><Input type="number" min="1" max="64" value={kafkaSource.partitions} onChange={(event) => setKafkaSource((current) => ({ ...current, partitions: event.target.value }))} /></div><div><label className="mb-1.5 block text-xs font-medium">Replication factor</label><Input type="number" min="1" value={kafkaSource.replicationFactor} onChange={(event) => setKafkaSource((current) => ({ ...current, replicationFactor: event.target.value }))} /></div></div><div className="flex flex-wrap gap-2"><Button variant="outline" onClick={checkKafka} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <HeartPulse />} Test broker</Button><Button variant="outline" onClick={createTopic} disabled={loading}><Plus /> Create topic</Button><Button onClick={toggleKafka} disabled={loading}>{kafkaListening ? <><Pause /> Pause receiving</> : <><Play /> Start receiving</>}</Button></div>{kafkaStatus && <div className="rounded-lg border bg-slate-50/70 p-3 text-xs text-muted-foreground">Connected · {kafkaStatus.brokers} broker(s) · topic {kafkaStatus.topicExists ? 'available' : 'not created yet'}</div>}<p className="text-[11px] leading-4 text-muted-foreground">Credentials are kept in app memory. Received messages are not committed until their NIST files import successfully. Use a dedicated topic and consumer group for this app.</p></CardContent></Card>
+            {view === 'kafka' && <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Radio className="size-5" /></div><CardTitle className="text-base">Kafka source</CardTitle><CardDescription>Connect to a Kafka cluster. Topic creation requires an existing, reachable broker.</CardDescription></CardHeader><CardContent className="space-y-3"><div><label className="mb-1.5 block text-xs font-medium">Bootstrap brokers</label><Input value={kafkaSource.brokers} onChange={(event) => setKafkaSource((current) => ({ ...current, brokers: event.target.value }))} placeholder="broker1:9092,broker2:9092" /></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">Topic</label><Input value={kafkaSource.topic} onChange={(event) => setKafkaSource((current) => ({ ...current, topic: event.target.value }))} placeholder="herta.nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Consumer group</label><Input value={kafkaSource.groupId} onChange={(event) => setKafkaSource((current) => ({ ...current, groupId: event.target.value }))} /></div></div><div><label className="mb-1.5 block text-xs font-medium">Message format</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={kafkaSource.messageFormat} onChange={(event) => setKafkaSource((current) => ({ ...current, messageFormat: event.target.value }))}><option value="json-base64">JSON with Base64 NIST fileContent</option><option value="raw-nist">Raw NIST bytes</option></select></div><div className="grid gap-3 sm:grid-cols-2"><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={kafkaSource.tls} onCheckedChange={(checked) => setKafkaSource((current) => ({ ...current, tls: Boolean(checked) }))} /> Use TLS</label><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={kafkaSource.verifyTls} onCheckedChange={(checked) => setKafkaSource((current) => ({ ...current, verifyTls: Boolean(checked) }))} /> Verify certificate</label></div><div className="grid gap-3 sm:grid-cols-3"><div className="sm:col-span-1"><label className="mb-1.5 block text-xs font-medium">SASL</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={kafkaSource.mechanism} onChange={(event) => setKafkaSource((current) => ({ ...current, mechanism: event.target.value }))}><option value="none">None</option><option value="plain">PLAIN</option><option value="scram-sha-256">SCRAM-256</option><option value="scram-sha-512">SCRAM-512</option></select></div><Input className="self-end" disabled={kafkaSource.mechanism === 'none'} value={kafkaSource.username} onChange={(event) => setKafkaSource((current) => ({ ...current, username: event.target.value }))} placeholder="SASL username" /><Input className="self-end" type="password" autoComplete="off" disabled={kafkaSource.mechanism === 'none'} value={kafkaSource.password} onChange={(event) => setKafkaSource((current) => ({ ...current, password: event.target.value }))} placeholder="SASL password" /></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">New topic partitions</label><Input type="number" min="1" max="64" value={kafkaSource.partitions} onChange={(event) => setKafkaSource((current) => ({ ...current, partitions: event.target.value }))} /></div><div><label className="mb-1.5 block text-xs font-medium">Replication factor</label><Input type="number" min="1" value={kafkaSource.replicationFactor} onChange={(event) => setKafkaSource((current) => ({ ...current, replicationFactor: event.target.value }))} /></div></div><div className="flex flex-wrap gap-2"><Button variant="outline" onClick={checkKafka} disabled={loading}>{loading ? <LoaderCircle className="animate-spin" /> : <HeartPulse />} Test broker</Button><Button variant="outline" onClick={createTopic} disabled={loading}><Plus /> Create topic</Button><Button onClick={toggleKafka} disabled={loading}>{kafkaListening ? <><Pause /> Pause receiving</> : <><Play /> Start receiving</>}</Button></div>{kafkaStatus && <div className="rounded-lg border bg-slate-50/70 p-3 text-xs text-muted-foreground">Connected · {kafkaStatus.brokers} broker(s) · topic {kafkaStatus.topicExists ? 'available' : 'not created yet'}</div>}<p className="text-[11px] leading-4 text-muted-foreground">Credentials are kept in app memory. Received messages are not committed until their NIST files import successfully. Use a dedicated topic and consumer group for this app.</p></CardContent></Card>}
 
-            <Card><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Server className="size-5" /></div><CardTitle className="text-base">Create a local REST receiver</CardTitle><CardDescription>Let a REST source push NIST files into this desktop app for review.</CardDescription></CardHeader><CardContent className="space-y-3">{receiver.running ? <><div className="rounded-lg border bg-slate-50/70 p-3 text-xs"><div className="font-medium">POST http://127.0.0.1:{receiver.port}/api/v1/nist</div><div className="mt-1 break-all text-muted-foreground">Authorization: Bearer {receiver.token}</div></div><div className="text-xs leading-5 text-muted-foreground">This listener accepts only connections from this computer. The token is temporary and clears when the app closes.</div><Button variant="outline" onClick={stopReceiver}><Pause /> Stop receiver</Button></> : <><div><label className="mb-1.5 block text-xs font-medium">Local port</label><Input type="number" min="1024" max="65535" value={receiver.port} onChange={(event) => setReceiver((current) => ({ ...current, port: event.target.value }))} /></div><div className="rounded-lg border bg-slate-50/70 p-3 text-xs leading-5 text-muted-foreground">POST JSON <code>{'{ "code": "SUB001", "fileContent": "BASE64_NIST" }'}</code> or raw NIST bytes with <code>Content-Type: application/octet-stream</code> and <code>X-File-Name</code>.</div><Button onClick={startReceiver} disabled={loading}><Play /> Start local receiver</Button></>}</CardContent></Card>
+            {view === 'rest' && <><Card id="rest-receiver"><CardHeader><div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-[#edf3f8] text-[#315a80]"><Server className="size-5" /></div><CardTitle className="text-base">Receive data with REST</CardTitle><CardDescription>Start a local endpoint so another app or script can POST NIST files here.</CardDescription></CardHeader><CardContent className="space-y-3">{receiver.running ? <><div className="rounded-lg border bg-slate-50/70 p-3 text-xs"><div className="font-medium">POST http://127.0.0.1:{receiver.port}/api/v1/nist</div><div className="mt-1 break-all text-muted-foreground">Authorization: Bearer {receiver.token}</div></div><div className="text-xs leading-5 text-muted-foreground">This listener accepts only connections from this computer. The token is temporary and clears when the app closes.</div><Button variant="outline" onClick={stopReceiver}><Pause /> Stop receiver</Button></> : <><div><label className="mb-1.5 block text-xs font-medium">Local port</label><Input type="number" min="1024" max="65535" value={receiver.port} onChange={(event) => setReceiver((current) => ({ ...current, port: event.target.value }))} /></div><div className="rounded-lg border bg-slate-50/70 p-3 text-xs leading-5 text-muted-foreground">POST JSON <code>{'{ "code": "SUB001", "fileContent": "BASE64_NIST" }'}</code> or raw NIST bytes with <code>Content-Type: application/octet-stream</code> and <code>X-File-Name</code>.</div><Button onClick={startReceiver} disabled={loading}><Play /> Start local receiver</Button></>}</CardContent></Card></>}
 
-            <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Received NIST inbox</CardTitle><CardDescription className="mt-1">{sourceInbox.length} item(s) waiting on this desktop</CardDescription></div><Button variant="ghost" size="sm" onClick={() => setInboxSelection(new Set(sourceInbox.filter((item) => !item.error).map((item) => item.id)))}>Select valid</Button><Button variant="outline" size="sm" onClick={refreshInbox}><RefreshCw /> Refresh</Button></CardHeader><CardContent className="space-y-3"><div className="max-h-[280px] space-y-2 overflow-auto">{sourceInbox.length ? sourceInbox.map((item) => <div key={item.id} className="flex items-center gap-3 rounded-lg border px-3 py-2.5">{item.error ? <CircleHelp className="size-4 shrink-0 text-amber-600" /> : <Checkbox checked={inboxSelection.has(item.id)} onCheckedChange={(checked) => setInboxSelection((current) => { const next = new Set(current); checked ? next.add(item.id) : next.delete(item.id); return next; })} />}<div className="min-w-0 flex-1"><div className="truncate text-xs font-medium">{item.name}</div><div className="mt-0.5 truncate text-[11px] text-muted-foreground">{item.source}{item.error ? ` · ${item.error}` : ` · ${formatSize(item.size)}`}</div></div>{item.error && <Button variant="ghost" size="sm" onClick={() => discardInboxItem(item.id)}>Discard</Button>}</div>) : <div className="rounded-lg border border-dashed py-8 text-center text-xs text-muted-foreground">No REST or Kafka messages received yet.</div>}</div><Button className="w-full" onClick={loadReceived} disabled={loading || inboxSelection.size === 0}><ArrowRight /> Review selected files in NIST import</Button></CardContent></Card>
+            <Card className="overflow-hidden border-slate-200 shadow-sm">
+              <CardHeader className="border-b bg-white px-5 py-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div><CardTitle className="text-base">Received NIST inbox</CardTitle><CardDescription className="mt-1">{sourceInbox.length} waiting · {sourceInbox.filter((item) => !item.error).length} ready · {sourceInbox.filter((item) => item.error).length} need attention</CardDescription></div>
+                  <Button variant="outline" size="sm" onClick={refreshInbox}><RefreshCw /> Refresh</Button>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-3 p-4 sm:p-5">
+                <div className="flex flex-wrap items-center gap-2 rounded-xl bg-slate-50 p-2.5">
+                  <label htmlFor="inbox-select-menu" className="text-[11px] font-medium text-slate-600">Quick select</label>
+                  <select id="inbox-select-menu" defaultValue="" onChange={(event) => { selectInboxItems(event.target.value); event.target.value = ''; }} className="h-9 min-w-[190px] flex-1 rounded-md border border-slate-200 bg-white px-3 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-ring">
+                    <option value="" disabled>Choose which items…</option><option value="valid">All ready to import</option><option value="errors">All needing attention</option><option value="all">Everything</option><option value="clear">Clear selection</option>
+                  </select>
+                  <span className="text-[11px] text-slate-500">{inboxSelection.size} selected</span>
+                </div>
+                <div className="max-h-[360px] space-y-2 overflow-auto pr-1">
+                  {sourceInbox.length ? sourceInbox.map((item) => <div key={item.id} className={`rounded-xl border p-3 transition-colors ${item.error ? 'border-amber-200 bg-amber-50/40' : inboxSelection.has(item.id) ? 'border-blue-200 bg-blue-50/40' : 'border-slate-200 bg-white'}`}>
+                    <div className="flex items-start gap-3">
+                      <Checkbox checked={inboxSelection.has(item.id)} aria-label={`Select ${item.name}`} onCheckedChange={(checked) => setInboxSelection((current) => { const next = new Set(current); checked ? next.add(item.id) : next.delete(item.id); return next; })} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2"><div className="min-w-0 flex-1 truncate text-xs font-semibold text-slate-800">{item.name}</div><Badge variant="secondary" className={item.error ? 'bg-amber-100 text-amber-800' : 'bg-emerald-50 text-emerald-700'}>{item.error ? 'Needs attention' : 'Ready to import'}</Badge></div>
+                        <div className="mt-1 text-[11px] text-slate-500">{item.source}{item.kafka ? ` · partition ${item.kafka.partition}, offset ${item.kafka.offset}` : ''}{!item.error ? ` · ${formatSize(item.size)}` : ''}{item.createdAt ? ` · ${new Date(item.createdAt).toLocaleString()}` : ''}</div>
+                        {item.error && <div className="mt-2 rounded-lg border border-amber-200/80 bg-white/80 p-2.5"><div className="text-[11px] font-medium text-amber-900">This message cannot be imported yet.</div><div className={`mt-1 break-words text-[11px] leading-5 text-amber-800 ${expandedInboxError === item.id ? 'whitespace-pre-wrap' : 'line-clamp-2'}`}>{item.error}</div><button className="mt-1 text-[11px] font-semibold text-amber-900 underline underline-offset-2" onClick={() => setExpandedInboxError((current) => current === item.id ? '' : item.id)}>{expandedInboxError === item.id ? 'Show less' : 'Show full error'}</button></div>}
+                      </div>
+                      <Button variant="ghost" size="sm" className="shrink-0 text-slate-500 hover:text-rose-700" aria-label={`Remove ${item.name}`} onClick={() => discardInboxItem(item.id)}><X /></Button>
+                    </div>
+                  </div>) : <div className="rounded-xl border border-dashed py-10 text-center"><div className="text-sm font-medium text-slate-700">Inbox is clear</div><div className="mt-1 text-xs text-muted-foreground">New REST and Kafka messages will show up here.</div></div>}
+                </div>
+                <div className="flex flex-col gap-2 border-t border-slate-100 pt-3 sm:flex-row">
+                  <Button className="flex-1" onClick={loadReceived} disabled={loading || inboxBusy || ![...inboxSelection].some((id) => sourceInbox.some((item) => item.id === id && !item.error))}><ArrowRight /> Review ready items{[...inboxSelection].some((id) => sourceInbox.some((item) => item.id === id && !item.error)) ? ` (${[...inboxSelection].filter((id) => sourceInbox.some((item) => item.id === id && !item.error)).length})` : ''}</Button>
+                  <Button variant="outline" className="text-rose-700 hover:bg-rose-50 hover:text-rose-800" onClick={discardSelectedInbox} disabled={!inboxSelection.size || inboxBusy}>{inboxBusy ? <LoaderCircle className="animate-spin" /> : <Trash2 />} Remove selected</Button>
+                </div>
+                {inboxSelection.size > 0 && [...inboxSelection].some((id) => sourceInbox.some((item) => item.id === id && item.error)) && <p className="text-[11px] text-amber-700">Review imports only processes ready items. Selected error items can be removed with “Remove selected”.</p>}
+              </CardContent>
+            </Card>
           </div>
         </>}
 
