@@ -98,6 +98,7 @@ export default function App() {
   const [receiver, setReceiver] = useState({ running: false, port: '8006', token: '' });
   const [integrationMessage, setIntegrationMessage] = useState('');
   const [connectors, setConnectors] = useState([]);
+  const [connectorType, setConnectorType] = useState('rest');
   const [connectorChecks, setConnectorChecks] = useState({});
   const [connectorDialogOpen, setConnectorDialogOpen] = useState(false);
   const [editingConnectorId, setEditingConnectorId] = useState('');
@@ -379,10 +380,10 @@ export default function App() {
         const workerConnectors = new Map((next.worker.connectors || []).map((item) => [item.id, item]));
         setConnectors((current) => current.map((item) => {
           const runtime = workerConnectors.get(item.id);
-          if (!runtime) return item.type === 'kafka' || item.mode === 'receiver' ? { ...item, active: false, runtimeStatus: 'inactive' } : item;
+          if (!runtime) return { ...item, runtimeStatus: 'not-applied' };
           return { ...item, active: Boolean(runtime.active), runtimeStatus: runtime.status, lastError: runtime.lastError || '', lastRunAt: runtime.lastRunAt || null, nextRunAt: runtime.nextRunAt || null, received: runtime.received || 0, lastBackupFile: runtime.lastBackupFile || '', lastBackupBytes: runtime.lastBackupBytes || 0 };
         }));
-      } else { setKafkaListening(false); setReceiver((current) => ({ ...current, running: false, token: '' })); setConnectors((current) => current.map((item) => item.type === 'kafka' || item.mode === 'receiver' ? { ...item, active: false } : item)); setTelegramStatus({ configured: Boolean(telegram.botToken && telegram.chatId), connected: false, botName: '', checkedAt: null, lastError: 'Docker worker is stopped.' }); }
+      } else { setKafkaListening(false); setReceiver((current) => ({ ...current, running: false, token: '' })); setConnectors((current) => current.map((item) => ({ ...item, runtimeStatus: 'offline' }))); setTelegramStatus({ configured: Boolean(telegram.botToken && telegram.chatId), connected: false, botName: '', checkedAt: null, lastError: 'Docker worker is stopped.' }); }
     }
     catch (error) { setPlatformError(error.message); }
   }, [invoke, telegram.botToken, telegram.chatId]);
@@ -555,6 +556,7 @@ export default function App() {
   };
 
   const openConnectorDialog = (type = 'rest', connector = null) => {
+    if (type === 'rest' || type === 'kafka') setConnectorType(type);
     setEditingConnectorId(connector?.id || '');
     const draft = connector ? { ...connector, config: { ...connector.config } } : createConnectorDraft(type);
     if (draft.type === 'rest' && draft.mode !== 'receiver') {
@@ -579,7 +581,7 @@ export default function App() {
     const current = connectors.find((item) => item.id === editingConnectorId);
     const config = { ...connectorDraft.config };
     if (connectorDraft.type === 'rest' && connectorDraft.mode !== 'receiver') {
-      config.headers = Object.fromEntries((config.headerRows || []).filter((header) => header.key.trim()).map((header) => [header.key.trim(), header.value]));
+      config.headers = {};
       delete config.headerRows;
       delete config.bearerToken;
       config.pollEverySeconds = Number(config.pollEverySeconds) || 60;
@@ -695,7 +697,7 @@ export default function App() {
           <p className="mt-2 truncate text-[11px] text-slate-500" title={session.baseUrl}>{session.baseUrl}</p>
         </div>
         <Button variant="ghost" className="mt-3 w-full justify-start text-slate-600 hover:bg-slate-100 hover:text-slate-900" onClick={signOut}><LogOut /> Sign out</Button>
-        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.9.20'}</div>
+        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.9.22'}</div>
       </div>
     </aside>
 
@@ -717,7 +719,7 @@ export default function App() {
           </div>
 
           <Card className="mt-5 border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><div className="flex items-center gap-2"><PlugZap className="size-4 text-slate-500" /><div><CardTitle className="text-base">Connector status</CardTitle><CardDescription className="mt-1">Each saved worker connector reports its own state and activity.</CardDescription></div><Button className="ml-auto" size="sm" variant="outline" onClick={() => setView('connectors')}>Manage connectors <ArrowRight /></Button></div></CardHeader><CardContent className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">
-            {connectors.map((connector) => {
+            {connectors.filter((connector) => connector.type === 'rest' || connector.type === 'kafka').map((connector) => {
               const failed = connector.runtimeStatus === 'error';
               const active = Boolean(connector.active) && platform.worker?.ok;
               const kind = connector.type === 'kafka' ? 'Kafka' : connector.type === 'postgres' ? 'PostgreSQL backup' : connector.mode === 'receiver' ? 'REST receiver' : 'REST pull';
@@ -793,6 +795,12 @@ export default function App() {
 
         {view === 'backups' && <>
           <PageHeading eyebrow="Recovery" title="Backup & restore" description="Create a portable NIST snapshot or preview a previous snapshot before restoring it." />
+          <details className="mb-5 rounded-xl border border-slate-200 bg-white p-5">
+            <summary className="cursor-pointer text-sm font-semibold">PostgreSQL full database backups</summary>
+            <p className="mt-3 text-xs leading-5 text-slate-500">Enabled databases are included in manual and scheduled worker backups.</p>
+            <div className="mt-3 space-y-2">{connectors.filter((item) => item.type === 'postgres').map((database) => <div key={database.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"><div className="min-w-0"><p className="text-sm font-medium">{database.name}</p><p className="mt-1 break-all text-xs text-slate-500">{database.config.host}:{database.config.port || 5432} · {database.config.database} · {database.active ? 'Enabled' : 'Disabled'}</p>{database.lastError && <p className="mt-1 text-xs text-rose-700">{database.lastError}</p>}</div><div className="flex flex-wrap gap-2"><Button size="sm" onClick={() => setConnectorActive(database, !database.active)} disabled={loading || !platform.worker?.ok}>{database.active ? 'Disable backup' : 'Enable backup'}</Button><Button size="sm" variant="outline" onClick={() => openConnectorDialog('postgres', database)} disabled={database.active || loading}>Edit</Button><Button size="sm" variant="ghost" onClick={() => removeConnector(database)} disabled={loading}><Trash2 /> Remove</Button></div></div>)}</div>
+            <Button className="mt-3" variant="outline" size="sm" onClick={() => openConnectorDialog('postgres')}><Plus /> Add database backup</Button>
+          </details>
           <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_330px]">
             <div className="space-y-5">
               <Card className="overflow-hidden border-slate-200 shadow-sm">
@@ -823,7 +831,7 @@ export default function App() {
 
         {view === 'connectors' && <>
           <PageHeading eyebrow="Connections" title="Connectors" description="Two connector types: REST API and Kafka. Save each connection, test it and control its worker status here." />
-          <ConnectorManager connectors={connectors} worker={platform.worker} receiver={receiver} busy={loading || platformLoading} checks={connectorChecks} message={integrationMessage} onAdd={openConnectorDialog} onEdit={(connector) => openConnectorDialog(connector.type, connector)} onRemove={removeConnector} onToggle={setConnectorActive} onTest={(connector) => connector.type === 'kafka' ? checkKafkaConnector(connector) : testRestConnector(connector)} onFetch={fetchConnector} onCreateTopic={createKafkaConnectorTopic} onQueue={(type) => { setImportSource(type); setImportSourceExpanded(true); setView('import'); }} onRefresh={refreshPlatform} onDashboard={() => setView('overview')} />
+          <ConnectorManager selectedType={connectorType} onSelectType={setConnectorType} connectors={connectors} worker={platform.worker} receiver={receiver} busy={loading || platformLoading} checks={connectorChecks} message={integrationMessage} onAdd={openConnectorDialog} onEdit={(connector) => openConnectorDialog(connector.type, connector)} onRemove={removeConnector} onToggle={setConnectorActive} onTest={(connector) => connector.type === 'kafka' ? checkKafkaConnector(connector) : testRestConnector(connector)} onFetch={fetchConnector} onCreateTopic={createKafkaConnectorTopic} onQueue={(type) => { setImportSource(type); setImportSourceExpanded(true); setView('import'); }} onRefresh={refreshPlatform} onDashboard={() => setView('overview')} />
         </>}
         {view === 'telegram' && <>
           <PageHeading eyebrow="Notifications · Telegram" title="Telegram connector" description="Send a test message and receive worker notifications when REST or Kafka delivers NIST files." />
@@ -921,7 +929,7 @@ export default function App() {
       </div>
     </main>
 
-          <Dialog open={connectorDialogOpen} onOpenChange={setConnectorDialogOpen}><DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-[620px]"><DialogHeader><DialogTitle>{editingConnectorId ? 'Edit ' : 'Add '}{connectorDraft.type === 'rest' ? 'REST connector' : connectorDraft.type === 'kafka' ? 'Kafka connector' : 'database backup'}</DialogTitle><DialogDescription>{connectorDraft.type === 'rest' ? 'Enter the endpoint and any headers it needs.' : 'Save connection details once, then control whether this connector is active.'}</DialogDescription></DialogHeader><div className="space-y-4 py-2">
+          <Dialog open={connectorDialogOpen} onOpenChange={setConnectorDialogOpen}><DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-[620px]"><DialogHeader><DialogTitle>{editingConnectorId ? 'Edit ' : 'Add '}{connectorDraft.type === 'rest' ? 'REST connector' : connectorDraft.type === 'kafka' ? 'Kafka connector' : 'database backup'}</DialogTitle><DialogDescription>{connectorDraft.type === 'rest' ? 'Set the endpoint and HERTA destination group. No REST authentication needed.' : 'Save connection details once, then control whether this connector is active.'}</DialogDescription></DialogHeader><div className="space-y-4 py-2">
             {connectorDraft.type === 'rest' && <div><label htmlFor="rest-mode" className="mb-1.5 block text-xs font-medium">How to receive data</label><select id="rest-mode" value={connectorDraft.mode} onChange={(event) => setConnectorDraft((current) => ({ ...current, mode: event.target.value }))} className="h-10 w-full rounded-md border bg-white px-3 text-sm"><option value="pull">Pull from an API URL</option><option value="receiver">Receive POST requests</option></select></div>}<div><label htmlFor="connection-name" className="mb-1.5 block text-xs font-medium">Connection name{connectorDraft.type === 'rest' ? ' (optional)' : ''}</label><Input id="connection-name" value={connectorDraft.name} onChange={(event) => setConnectorDraft((current) => ({ ...current, name: event.target.value }))} placeholder={connectorDraft.type === 'kafka' ? 'Production Kafka' : connectorDraft.type === 'rest' ? 'Use endpoint name automatically' : 'HERTA PostgreSQL'} /></div>
             {connectorDraft.type === 'rest' ? <RestEndpointFields config={connectorDraft.config} receiver={connectorDraft.mode === 'receiver'} onChange={(config) => setConnectorDraft((current) => ({ ...current, config }))} /> : connectorDraft.type === 'kafka' ? <><div><label className="mb-1.5 block text-xs font-medium">Bootstrap brokers</label><Input value={connectorDraft.config.brokers || ''} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, brokers: event.target.value } }))} placeholder="broker1:9092,broker2:9092" /></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">Topic</label><Input value={connectorDraft.config.topic || ''} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, topic: event.target.value } }))} placeholder="herta.nist" /></div><div><label className="mb-1.5 block text-xs font-medium">Consumer group</label><Input value={connectorDraft.config.groupId || ''} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, groupId: event.target.value } }))} placeholder="herta-operations" /></div></div><div><label className="mb-1.5 block text-xs font-medium">Message format</label><select className="h-9 w-full rounded-md border border-input bg-white px-3 text-sm" value={connectorDraft.config.messageFormat || 'json-base64'} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, messageFormat: event.target.value } }))}><option value="json-base64">JSON with Base64 NIST fileContent</option><option value="raw-nist">Raw NIST bytes</option></select></div><div className="grid gap-3 sm:grid-cols-2"><div><label className="mb-1.5 block text-xs font-medium">Partitions when creating topic</label><Input type="number" min="1" max="64" value={connectorDraft.config.partitions || 1} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, partitions: event.target.value } }))} /></div><div><label className="mb-1.5 block text-xs font-medium">Replication factor</label><Input type="number" min="1" value={connectorDraft.config.replicationFactor || 1} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, replicationFactor: event.target.value } }))} /></div></div><div className="grid gap-3 sm:grid-cols-2"><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={Boolean(connectorDraft.config.tls)} onCheckedChange={(checked) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, tls: Boolean(checked) } }))} /> Use TLS</label><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={connectorDraft.config.verifyTls !== false} onCheckedChange={(checked) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, verifyTls: Boolean(checked) } }))} /> Verify certificate</label></div><div className="grid gap-3 sm:grid-cols-3"><select className="h-9 rounded-md border border-input bg-white px-3 text-sm" value={connectorDraft.config.mechanism || 'none'} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, mechanism: event.target.value } }))}><option value="none">No SASL</option><option value="plain">SASL PLAIN</option><option value="scram-sha-256">SCRAM-256</option><option value="scram-sha-512">SCRAM-512</option></select><Input disabled={!connectorDraft.config.mechanism || connectorDraft.config.mechanism === 'none'} value={connectorDraft.config.username || ''} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, username: event.target.value } }))} placeholder="SASL username" /><Input disabled={!connectorDraft.config.mechanism || connectorDraft.config.mechanism === 'none'} type="password" autoComplete="off" value={connectorDraft.config.password || ''} onChange={(event) => setConnectorDraft((current) => ({ ...current, config: { ...current.config, password: event.target.value } }))} placeholder="SASL password" /></div></> : <PostgresConnectorFields config={connectorDraft.config} onChange={(config) => setConnectorDraft((current) => ({ ...current, config }))} />}
           </div><DialogFooter><Button variant="outline" onClick={() => setConnectorDialogOpen(false)}>Cancel</Button><Button onClick={saveConnectorDraft}><Plus /> Save connector</Button></DialogFooter></DialogContent></Dialog>
@@ -937,7 +945,7 @@ function Login({ config, setConfig, notice, loading, onSubmit }) {
     <section className="hidden w-[48%] flex-col justify-between border-r border-slate-200 bg-[#f3f6f9] px-12 py-10 text-slate-800 lg:flex">
       <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><Fingerprint className="size-6" /></div><div><div className="font-semibold tracking-wide">HERTA</div><div className="text-[11px] text-slate-500">Operations desktop</div></div></div>
       <div className="max-w-[500px] pb-6"><div className="mb-6 flex size-12 items-center justify-center rounded-2xl border border-slate-200 bg-white"><Database className="size-6 text-[#53799f]" /></div><div className="text-[34px] font-semibold leading-[1.17] tracking-tight">Biometric operations, <span className="text-[#53799f]">thoughtfully connected.</span></div><p className="mt-5 max-w-[420px] text-sm leading-6 text-slate-600">A secure desktop workspace for HERTA subject records, NIST file operations, and profile metadata checks.</p><div className="mt-9 grid grid-cols-3 gap-3"><Feature icon={Users} label="Subjects" /><Feature icon={FileArchive} label="NIST files" /><Feature icon={ShieldCheck} label="Local session" /></div></div>
-      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.9.20'}</div>
+      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.9.22'}</div>
     </section>
     <section className="flex flex-1 items-center justify-center px-6 py-10">
       <div className="w-full max-w-[410px]">
@@ -951,7 +959,7 @@ function Login({ config, setConfig, notice, loading, onSubmit }) {
           {notice && <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs leading-5 text-red-800">{notice}{notice.includes('TLS certificate') && config.verifyTls && <span className="mt-1 block font-medium">Uncheck “Verify server certificate” and try again if this is your trusted local HERTA.</span>}</div>}
           <Button type="submit" className="h-10 w-full" disabled={loading}>{loading ? <><LoaderCircle className="animate-spin" /> Connecting...</> : <>Sign in <ArrowRight /></>}</Button>
         </form>
-        <div className="mt-6 flex items-start gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Your password is never saved. The access token is stored securely so the Docker worker can keep scheduled backups running; signing out clears the token from both the app and worker.</span></div>
+        <div className="mt-6 flex items-start gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Your HERTA credentials are encrypted for automatic hourly sign-in. The Docker worker renews access in the background; signing out clears saved credentials from the app and worker.</span></div>
       </div>
     </section>
   </div>;
@@ -963,11 +971,9 @@ function restConnectorName(value) {
   catch { return 'REST endpoint'; }
 }
 function RestEndpointFields({ config, onChange, receiver }) {
-  if (receiver) return <div className="rounded-lg border bg-slate-50 p-3 text-xs leading-5 text-muted-foreground">This saved receiver uses the local worker endpoint. Existing receiver settings are kept as configured.</div>;
-  const rows = config.headerRows?.length ? config.headerRows : [{ key: '', value: '' }];
-  const updateHeader = (index, key, value) => onChange({ ...config, headerRows: rows.map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row) });
-  return <div className="space-y-4"><div><label className="mb-1.5 block text-xs font-medium">Endpoint URL</label><Input type="url" autoFocus value={config.url || ''} onChange={(event) => onChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/nist" /></div><div><div className="mb-1.5 flex items-center justify-between"><label className="text-xs font-medium">Headers</label><Button size="sm" variant="outline" onClick={() => onChange({ ...config, headerRows: [...rows, { key: '', value: '' }] })}><Plus /> Add header</Button></div><div className="space-y-2">{rows.map((header, index) => <div key={index} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_36px] gap-2"><Input aria-label={`Header ${index + 1} name`} value={header.key} onChange={(event) => updateHeader(index, 'key', event.target.value)} placeholder="Header name" /><Input aria-label={`Header ${index + 1} value`} value={header.value} onChange={(event) => updateHeader(index, 'value', event.target.value)} placeholder="Header value" /><Button size="icon" variant="ghost" aria-label="Remove header" onClick={() => onChange({ ...config, headerRows: rows.filter((_, rowIndex) => rowIndex !== index) })}><X /></Button></div>)}</div><p className="text-[11px] text-muted-foreground">Example: <code className="mono">Authorization</code> · <code className="mono">Bearer token</code></p></div></div>;
+ return <div className="space-y-3">{!receiver && <div><label className="mb-1.5 block text-xs font-medium">Endpoint URL</label><Input type="url" value={config.url || ''} onChange={event => onChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/nist" /></div>}<div><label className="mb-1.5 block text-xs font-medium">HERTA destination group</label><Input value={config.group || '0'} onChange={event => onChange({ ...config, group: event.target.value })} /></div><p className="rounded-lg bg-slate-50 p-3 text-xs text-muted-foreground">No REST authentication required. Files are imported directly into HERTA by the worker. Failed imports stay in the queue for review.</p></div>;
 }
+
 function createConnectorDraft(type = 'rest', name = '') {
   if (type === 'kafka') return { type, name, mode: 'consumer', active: false, config: { brokers: 'localhost:9092', topic: 'herta.nist', groupId: 'herta-operations-desktop', tls: false, verifyTls: true, mechanism: 'none', username: '', password: '', messageFormat: 'json-base64', partitions: 1, replicationFactor: 1 } };
   if (type === 'postgres') return { type, name, mode: 'backup', active: false, config: { host: '', port: 5432, database: '', username: '', password: '', sslMode: 'require' } };

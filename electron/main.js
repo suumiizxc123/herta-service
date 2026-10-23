@@ -1,3 +1,4 @@
+const { createHertaAuth } = require('./herta-auth');
 const { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -99,12 +100,14 @@ async function restoreHertaSession() {
     const restored = JSON.parse(decrypted.result);
     if (!restored?.token || !restored?.baseUrl) throw new Error('Invalid saved session.');
     const baseUrl = normalizeBaseUrl(restored.baseUrl);
-    const candidate = { baseUrl, token: String(restored.token), verifyTls: Boolean(restored.verifyTls) };
-    const response = await requestJson(baseUrl, candidate.verifyTls, '/api/v1/subjects?offset=0&size=1', { token: candidate.token });
+    const candidate = { ...restored, baseUrl, token: String(restored.token), verifyTls: Boolean(restored.verifyTls) };
+    hertaSession = candidate;
+    const response = await desktopAuth.request(active => requestJson(baseUrl, active.verifyTls, '/api/v1/subjects?offset=0&size=1', { token: active.token }));
     if (!Array.isArray(response.subjects)) throw new Error('Saved HERTA session could not be verified.');
     hertaSession = candidate;
     await DockerPlatform.setWorkerSession(app, hertaSession);
   } catch (error) {
+    hertaSession = null;
     if (error.status === 401 || error.status === 403 || error instanceof SyntaxError) await fs.rm(sessionFile(), { force: true }).catch(() => {});
   }
 }
@@ -259,12 +262,12 @@ function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json
   });
 }
 
-function authorizedJson(pathname, options = {}) {
-  const session = assertSignedIn();
-  return requestJson(session.baseUrl, session.verifyTls, pathname, { ...options, token: session.token }).catch((error) => {
-      if (error.status === 401 || error.status === 403) { hertaSession = null; void persistHertaSession(null); void DockerPlatform.setWorkerSession(app, null); }
-    throw error;
-  });
+const desktopAuth = createHertaAuth({ getSession: () => hertaSession, login: active => requestJson(active.baseUrl, active.verifyTls, '/api/v1/auth/login', { method: 'POST', json: { username: active.username, password: active.password } }), persist: persistHertaSession });
+async function authorizedJson(pathname, options = {}) {
+ assertSignedIn();
+ const status = await DockerPlatform.workerRequest(app, '/api/status').catch(() => null);
+ if (status?.ok && status.authenticated) return DockerPlatform.workerRequest(app, '/api/herta/request', { method: 'POST', body: { pathname, options }, timeout: 150000 });
+ return desktopAuth.request(active => requestJson(active.baseUrl, active.verifyTls, pathname, { ...options, token: active.token }));
 }
 
 function csvEscape(value) {
@@ -707,7 +710,7 @@ async function runImport({ ids, group = '0', confirmation = '' }) {
     const row = { File: file.name, Code: path.parse(file.name).name || file.name, Status: 'Failed', HttpStatus: '', Bytes: file.size, Message: '' };
     try {
       const data = file.data !== undefined ? file.data : await fs.readFile(file.path);
-      const response = await requestJson(session.baseUrl, session.verifyTls, '/api/v1/subjects/import', {
+      const response = await authorizedJson('/api/v1/subjects/import', {
         method: 'POST',
         token: session.token,
         json: { data: data.toString('base64'), format: 'nist', group: String(group) },
@@ -865,9 +868,9 @@ function registerIpc() {
     const token = response.access_token || response.accessToken;
     if (!token) throw new Error('HERTA sign-in did not return an access token.');
     subjectImageCache.clear();
-    hertaSession = { baseUrl: normalized, verifyTls: verified, token: String(token) };
+    hertaSession = { baseUrl: normalized, verifyTls: verified, token: String(token), username: String(username).trim(), password: String(password), authenticatedAt: Date.now() };
     await persistHertaSession(hertaSession).catch(() => false);
-    void DockerPlatform.setWorkerSession(app, hertaSession);
+    await DockerPlatform.setWorkerSession(app, hertaSession);
     await recordActivity('Signed in', 'A HERTA desktop session started.');
     return { authenticated: true, baseUrl: normalized };
   });

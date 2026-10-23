@@ -7,6 +7,7 @@ RUN mkdir -p /data /backups && chown -R node:node /app /data /backups
 COPY platform/worker/server.js ./platform/worker/server.js
 COPY electron/source-files.js ./electron/source-files.js
 COPY electron/backup-archive.js ./electron/backup-archive.js
+COPY electron/herta-auth.js ./electron/herta-auth.js
 COPY electron/cron.js ./electron/cron.js
 COPY electron/http-headers.js ./electron/http-headers.js
 USER node

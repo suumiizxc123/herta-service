@@ -160,7 +160,7 @@ async function setWorkerSession(app, value) {
     if (target.hostname === 'localhost' || target.hostname === '127.0.0.1') target.hostname = 'host.docker.internal';
     baseUrl = target.toString().replace(/\/$/, '');
   }
-  const body = value ? { baseUrl, token: value.token, verifyTls: Boolean(value.verifyTls) } : undefined;
+  const body = value ? { baseUrl, token: value.token, verifyTls: Boolean(value.verifyTls), username: value.username, password: value.password, authenticatedAt: value.authenticatedAt } : undefined;
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 5000);
   try {
     const response = await fetch(`${WORKER_URL}/api/session`, { method: value ? 'POST' : 'DELETE', headers: { Authorization: `Bearer ${env.token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });

@@ -1,3 +1,4 @@
+const { createHertaAuth } = require('../../electron/herta-auth');
 const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs/promises');
@@ -100,7 +101,7 @@ async function pollRestConnector(connector, { throwOnError = false } = {}) {
   try {
     const target = new URL(String(connector.config?.url || ''));
     if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
-    const response = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { token: String(connector.config.bearerToken || '') || undefined, headers: connector.config.headers });
+    const response = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { headers: Object.fromEntries(Object.entries(connector.config.headers || {}).filter(([key]) => !/^(authorization|proxy-authorization)$/i.test(key))) });
     const files = normalizeNistSourcePayload(response);
     const seen = new Set(Array.isArray(connector.seen) ? connector.seen : []);
     const fresh = files.filter((item) => {
@@ -110,11 +111,13 @@ async function pollRestConnector(connector, { throwOnError = false } = {}) {
     });
     connector.seen = [...seen].slice(-3000);
     const ids = fresh.length ? await addFiles(fresh, `REST · ${connector.name}`, null, connector.id) : [];
+    const queued = ids.map(id => inboxSummary(inbox.get(id)));
+    const results = await importRestFiles(ids, connector.config?.group || '0');
     await persistConnectors();
     const now = new Date(); const interval = Math.max(15, Math.min(86400, Number(connector.config.pollEverySeconds) || 60));
     saveRuntime(connector.id, { status: connector.active ? 'active' : 'inactive', lastRunAt: now.toISOString(), lastError: '', received: (runtime.received || 0) + ids.length, nextRunAt: connector.active ? new Date(now.getTime() + interval * 1000).toISOString() : null });
     if (ids.length) await recordConnectorEvent(connector, 'Files received', 'success', `${ids.length} file(s) from REST.`);
-    return { count: ids.length, files: ids.map((id) => inboxSummary(inbox.get(id))) };
+    return { count: ids.length, files: queued, imported: results.filter(r => r.imported).length, results };
   } catch (error) {
     const interval = Math.max(15, Math.min(86400, Number(connector.config?.pollEverySeconds) || 60));
     saveRuntime(connector.id, { status: 'error', lastRunAt: new Date().toISOString(), lastError: error.message, nextRunAt: new Date(Date.now() + interval * 1000).toISOString() });
@@ -233,7 +236,7 @@ function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json
         let result = {};
         try { result = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}; }
         catch { return reject(new Error(`HERTA returned unreadable JSON (HTTP ${response.statusCode}).`)); }
-        if (response.statusCode < 200 || response.statusCode >= 300) return reject(new Error(`HERTA request failed (HTTP ${response.statusCode}). ${String(result.detail || result.message || '').slice(0, 300)}`));
+        if (response.statusCode < 200 || response.statusCode >= 300) return reject(Object.assign(new Error(`HERTA request failed (HTTP ${response.statusCode}). ${String(result.detail || result.message || '').slice(0, 300)}`), { status: response.statusCode }));
         resolve(result);
       });
     });
@@ -244,7 +247,34 @@ function requestJson(baseUrl, verifyTls, pathname, { method = 'GET', token, json
   });
 }
 function requireSession() { if (!session?.token) throw new Error('Sign in to HERTA from the desktop app first.'); return session; }
-async function hertaJson(pathname, options) { const active = requireSession(); return requestJson(active.baseUrl, active.verifyTls, pathname, { ...options, token: active.token }); }
+const credentialsFile = path.join(DATA_DIR, 'herta-credentials.enc');
+const credentialKey = crypto.createHash('sha256').update(API_TOKEN).digest();
+async function persistSession(value) {
+ const { username, password, ...publicSession } = value;
+ await writeJson(SESSION_FILE, publicSession);
+ if (username && password) {
+ const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', credentialKey, iv);
+ const data = Buffer.concat([cipher.update(JSON.stringify({ username, password })), cipher.final()]);
+ await writeJson(credentialsFile, { iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: data.toString('base64') });
+ } else await fs.rm(credentialsFile, { force: true });
+}
+const hertaAuth = createHertaAuth({ getSession: () => session, login: active => requestJson(active.baseUrl, active.verifyTls, '/api/v1/auth/login', { method: 'POST', json: { username: active.username, password: active.password } }), persist: persistSession });
+async function hertaJson(pathname, options) { return hertaAuth.request(active => requestJson(active.baseUrl, active.verifyTls, pathname, { ...options, token: active.token })); }
+async function importRestFiles(ids, group = '0') {
+ const results = [];
+ for (const id of ids) {
+ const item = inbox.get(id);
+ try {
+ const data = await fs.readFile(item.file);
+ await hertaJson('/api/v1/subjects/import', { method: 'POST', json: { data: data.toString('base64'), format: 'nist', group: String(group) } });
+ await recordConnectorEvent(connectors.find(c => c.id === item.connectorId), 'REST import', 'success', item.name);
+ await recordQueueEvent(item, 'imported', 'Automatically imported into HERTA via REST.'); await fs.rm(item.file, { force: true }); inbox.delete(id); await saveInbox();
+ results.push({ id, imported: true });
+ } catch(error) { item.error = error.message; await recordQueueEvent(item, 'failed', error.message); await saveInbox(); results.push({ id, imported: false, error: error.message }); }
+ }
+ return results;
+}
+
 async function getAllSubjects() {
   const records = []; let offset = 0; let count = Infinity;
   while (offset < count) {
@@ -472,7 +502,7 @@ async function route(request, response) {
   const url = new URL(request.url, 'http://localhost');
   if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'herta-worker', startedAt });
   if (url.pathname === '/api/v1/nist' && request.method === 'POST') {
-    if (!checkReceiverToken(request)) return json(response, 401, { error: 'Invalid receiver token.' });
+    if (!receiverToken) return json(response, 409, { error: 'Activate the REST receiver first.' });
     try {
       const body = await readBody(request); let files;
       if (String(request.headers['content-type'] || '').includes('application/octet-stream')) {
@@ -485,22 +515,23 @@ async function route(request, response) {
       saveRuntime(receiverConnectorId, { status: 'active', lastRunAt: new Date().toISOString(), lastError: '', received: (runtime.received || 0) + ids.length });
       await recordConnectorEvent(connectors.find((item) => item.id === receiverConnectorId), 'Files received', 'success', `${ids.length} file(s) via REST receiver.`);
     }
-    return json(response, 202, { accepted: ids.length, ids });
+    const results = await importRestFiles(ids, connectors.find(c => c.id === receiverConnectorId)?.config?.group || '0'); return json(response, results.every(r => r.imported) ? 200 : 202, { accepted: ids.length, ids, imported: results.filter(r => r.imported).length, results });
     } catch (error) { return json(response, 400, { error: error.message }); }
   }
   if (!requireApi(request, response)) return;
   try {
     if (request.method === 'GET' && url.pathname === '/api/status') return json(response, 200, {
-      ok: true, service: 'herta-worker', startedAt, authenticated: Boolean(session?.token), backup: { enabled: backupSettings.enabled, cron: backupSettings.cron, timezone: backupSettings.timezone, retentionCount: backupSettings.retentionCount, nextRun: backupSettings.enabled ? nextCronDate(backupSettings.cron, new Date(), backupSettings.timezone).toISOString() : null, running: backupBusy, lastRunAt: backupSettings.lastRunAt, lastRunStatus: backupSettings.lastRunStatus, lastRunMessage: backupSettings.lastRunMessage }, kafka: kafkaInfo || { listening: false }, receiver: { running: Boolean(receiverToken), connectorId: receiverConnectorId, port: 18127, token: receiverToken, url: 'http://127.0.0.1:18127/api/v1/nist' }, telegram: telegramStatus, connectors: connectors.map(connectorSummary), inbox: [...inbox.values()].map(inboxSummary),
+      ok: true, service: 'herta-worker', startedAt, authenticated: Boolean(session?.token), authentication: { automaticRenewal: Boolean(session?.username && session?.password), lastRenewedAt: session?.authenticatedAt || null, nextRenewalAt: session?.username ? new Date((session.authenticatedAt || 0) + 3600000).toISOString() : null }, backup: { enabled: backupSettings.enabled, cron: backupSettings.cron, timezone: backupSettings.timezone, retentionCount: backupSettings.retentionCount, nextRun: backupSettings.enabled ? nextCronDate(backupSettings.cron, new Date(), backupSettings.timezone).toISOString() : null, running: backupBusy, lastRunAt: backupSettings.lastRunAt, lastRunStatus: backupSettings.lastRunStatus, lastRunMessage: backupSettings.lastRunMessage }, kafka: kafkaInfo || { listening: false }, receiver: { running: Boolean(receiverToken), connectorId: receiverConnectorId, port: 18127, authenticationRequired: false, url: 'http://127.0.0.1:18127/api/v1/nist' }, telegram: telegramStatus, connectors: connectors.map(connectorSummary), inbox: [...inbox.values()].map(inboxSummary),
     });
     if (request.method === 'POST' && url.pathname === '/api/session') {
       const body = JSON.parse((await readBody(request)).toString('utf8'));
       const base = new URL(String(body.baseUrl || ''));
       if (!['http:', 'https:'].includes(base.protocol) || !body.token) throw new Error('A valid HERTA base URL and access token are required.');
-      session = { baseUrl: base.toString().replace(/\/$/, ''), token: String(body.token), verifyTls: Boolean(body.verifyTls) };
-      await writeJson(SESSION_FILE, session);
+      session = { baseUrl: base.toString().replace(/\/$/, ''), token: String(body.token), verifyTls: Boolean(body.verifyTls), username: String(body.username || ''), password: String(body.password || ''), authenticatedAt: Number(body.authenticatedAt) || Date.now() };
+      await persistSession(session);
       return json(response, 200, { authenticated: true });
     }
+    if (request.method === 'POST' && url.pathname === '/api/herta/request') { const body = JSON.parse((await readBody(request)).toString('utf8')); if (!/^\/api\/v1\/[a-z]/i.test(body.pathname) || body.pathname.includes('://') || body.pathname.includes('..')) throw new Error('Unsupported HERTA resource.'); return json(response, 200, await hertaJson(body.pathname, body.options)); }
     if (request.method === 'GET' && url.pathname === '/api/connectors') return json(response, 200, connectors.map(connectorSummary));
     if (request.method === 'PUT' && url.pathname === '/api/connectors') return json(response, 200, await applyConnectors(JSON.parse((await readBody(request)).toString('utf8'))));
     if (request.method === 'POST' && url.pathname === '/api/connectors/test') {
@@ -509,12 +540,12 @@ async function route(request, response) {
       if (!connector || connector.type !== 'rest' || connector.mode !== 'pull') throw new Error('Choose a saved REST pull connector to test.');
       const target = new URL(String(connector.config?.url || ''));
       if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
-      const payload = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { token: String(connector.config.bearerToken || '') || undefined, headers: connector.config.headers });
+      const payload = await requestJson(target.origin, connector.config.verifyTls !== false, target.href, { headers: Object.fromEntries(Object.entries(connector.config.headers || {}).filter(([key]) => !/^(authorization|proxy-authorization)$/i.test(key))) });
       const files = normalizeNistSourcePayload(payload);
       return json(response, 200, { ok: true, count: files.length, bytes: files.reduce((total, item) => total + item.data.length, 0), checkedAt: new Date().toISOString() });
     }
-    if (request.method === 'DELETE' && url.pathname === '/api/session') { session = null; await fs.rm(SESSION_FILE, { force: true }); return json(response, 200, { authenticated: false }); }
-    if (request.method === 'POST' && url.pathname === '/api/receiver/start') { const body = JSON.parse((await readBody(request)).toString('utf8') || '{}'); if (!receiverToken) receiverToken = crypto.randomBytes(32).toString('base64url'); receiverConnectorId = String(body.connectorId || ''); return json(response, 200, { running: true, connectorId: receiverConnectorId, port: 18127, token: receiverToken, url: 'http://127.0.0.1:18127/api/v1/nist' }); }
+    if (request.method === 'DELETE' && url.pathname === '/api/session') { session = null; await fs.rm(SESSION_FILE, { force: true }); await fs.rm(credentialsFile, { force: true }); return json(response, 200, { authenticated: false }); }
+    if (request.method === 'POST' && url.pathname === '/api/receiver/start') { const body = JSON.parse((await readBody(request)).toString('utf8') || '{}'); if (!receiverToken) receiverToken = crypto.randomBytes(32).toString('base64url'); receiverConnectorId = String(body.connectorId || ''); return json(response, 200, { running: true, connectorId: receiverConnectorId, port: 18127, authenticationRequired: false, url: 'http://127.0.0.1:18127/api/v1/nist' }); }
     if (request.method === 'POST' && url.pathname === '/api/receiver/stop') { receiverToken = ''; receiverConnectorId = ''; return json(response, 200, { running: false }); }
     if (request.method === 'GET' && url.pathname === '/api/telegram/status') return json(response, 200, telegramStatus);
     if (request.method === 'POST' && url.pathname === '/api/telegram/chats') {
@@ -580,8 +611,8 @@ async function route(request, response) {
       }
       const target = new URL(String(body.url || ''));
       if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Use a valid REST URL without embedded credentials.');
-      const result = await requestJson(target.toString(), Boolean(body.verifyTls), target.toString(), { token: String(body.bearerToken || '') || undefined });
-      const ids = await addFiles(normalizeNistSourcePayload(result), 'REST source'); return json(response, 200, { count: ids.length, files: ids.map((id) => inboxSummary(inbox.get(id))) });
+      const result = await requestJson(target.toString(), Boolean(body.verifyTls), target.toString(), {});
+      const ids = await addFiles(normalizeNistSourcePayload(result), 'REST source'); const files = ids.map(id => inboxSummary(inbox.get(id))); const results = await importRestFiles(ids, body.group || '0'); return json(response, 200, { count: ids.length, files, results, imported: results.filter(r => r.imported).length });
     }
     if (request.method === 'POST' && url.pathname === '/api/kafka/start') { const result = await startKafka(JSON.parse((await readBody(request)).toString('utf8'))); return json(response, 200, result); }
     if (request.method === 'POST' && url.pathname === '/api/kafka/stop') { await stopKafka(); return json(response, 200, { listening: false }); }
@@ -607,6 +638,7 @@ async function main() {
   queueHistory = await readJson(path.join(DATA_DIR, 'queue-history.json'), []);
   connectorHistory = await readJson(path.join(DATA_DIR, 'connector-history.json'), []);
   session = await readJson(SESSION_FILE, null);
+ if (session) { try { const saved = await readJson(credentialsFile, null); if (saved) { const decipher = crypto.createDecipheriv('aes-256-gcm', credentialKey, Buffer.from(saved.iv, 'base64')); decipher.setAuthTag(Buffer.from(saved.tag, 'base64')); Object.assign(session, JSON.parse(Buffer.concat([decipher.update(Buffer.from(saved.data, 'base64')), decipher.final()]).toString())); } } catch { console.error('Saved HERTA credentials cannot be decrypted; sign in again.'); } }
   if (session && (!session.token || !session.baseUrl)) { session = null; await fs.rm(SESSION_FILE, { force: true }); }
   connectors = await readJson(CONNECTORS_FILE, []);
   backupSettings = { ...backupSettings, ...await readJson(path.join(DATA_DIR, 'backup-settings.json'), backupSettings) };
@@ -618,7 +650,7 @@ async function main() {
   const server = http.createServer((request, response) => { void route(request, response); });
   server.listen(PORT, '0.0.0.0');
   if (telegramConfig.botToken && telegramConfig.chatId) void checkTelegram().catch(() => {});
-  scheduler = setInterval(() => { void tickBackup(); }, 5000);
+  scheduler = setInterval(() => { void tickBackup(); if (session?.username) void hertaAuth.renew().catch(error => console.error("HERTA renewal:", error.message)); }, 5000);
   const shutdown = async () => { clearInterval(scheduler); await stopKafka(); server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref(); };
   process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
   console.log(`HERTA worker listening on ${PORT}`);

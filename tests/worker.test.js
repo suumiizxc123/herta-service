@@ -182,3 +182,28 @@ test('REST connector test validates a NIST batch without enqueueing it', async (
   assert.equal(repeated.count, 0);
   assert.equal((await (await fetch(`${base}/api/inbox`, { headers })).json()).length, 1);
 });
+
+test('REST imports without intake auth, renews HERTA once, and encrypts credentials', async t => {
+ const dataDir=await fs.mkdtemp(path.join(os.tmpdir(),'herta-direct-test-'));
+ let logins=0, imports=0;
+ const mock=http.createServer(async(req,res)=>{
+ const chunks=[];for await(const chunk of req)chunks.push(chunk);
+ res.setHeader('Content-Type','application/json');
+ if(req.url==='/api/v1/auth/login'){logins++;res.end(JSON.stringify({access_token:'new-token'}));return;}
+ if(req.headers.authorization!=='Bearer new-token'){res.statusCode=401;res.end('{"message":"expired"}');return;}
+ const payload=JSON.parse(Buffer.concat(chunks));assert.equal(payload.format,'nist');assert.equal(payload.group,'0');imports++;res.end('{}');
+ });
+ await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+ const port=await freePort(),base=`http://127.0.0.1:${port}`,apiToken='integration-secret';
+ const child=startWorker(port,dataDir,apiToken);
+ t.after(async()=>{child.kill();await new Promise(r=>child.once('exit',r));await new Promise(r=>mock.close(r));await fs.rm(dataDir,{recursive:true,force:true});});
+ await waitForWorker(base);
+ const headers={Authorization:`Bearer ${apiToken}`,'Content-Type':'application/json'};
+ await fetch(`${base}/api/session`,{method:'POST',headers,body:JSON.stringify({baseUrl:`http://127.0.0.1:${mock.address().port}`,token:'expired',username:'admin',password:'sensitive-password',authenticatedAt:Date.now()})});
+ await fetch(`${base}/api/receiver/start`,{method:'POST',headers,body:'{}'});
+ const response=await fetch(`${base}/api/v1/nist`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:'direct',fileContent:Buffer.from('nist test').toString('base64')})});
+ assert.equal(response.status,200);assert.equal((await response.json()).imported,1);assert.equal(imports,1);assert.equal(logins,1);
+ assert.equal((await (await fetch(`${base}/api/inbox`,{headers})).json()).length,0);
+ for(const file of ['herta-session.json','herta-credentials.enc'])assert.ok(!(await fs.readFile(path.join(dataDir,file),'utf8')).includes('sensitive-password'));
+ assert.equal((await fetch(`${base}/api/herta/request`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
+});
