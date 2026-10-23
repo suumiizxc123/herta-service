@@ -9,7 +9,7 @@ const { unzipSync } = require('fflate');
 const { Kafka, logLevel } = require('kafkajs');
 const { createZip, inspectBackupArchive } = require('./backup-archive');
 const { MAX_FILES, safeNistName, normalizeNistSourcePayload } = require('./source-files');
-const { profileToText, subjectGroup, extractSubjectImage, summarizeSubject, makeSubjectDetails } = require('./subject-record');
+const { profileToText, subjectGroup, extractSubjectImage, extractImageFromNistBytes, summarizeSubject, makeSubjectDetails } = require('./subject-record');
 const { parseCron, matchesCron, nextCronDate } = require('./cron');
 
 const APP_PAGE = path.resolve(__dirname, '../dist/renderer/index.html');
@@ -30,6 +30,7 @@ let hertaSession = null;
 const selectedFiles = new Map();
 let auditCache;
 let subjectCache = [];
+const subjectImageCache = new Map();
 let kafkaConsumer = null;
 let kafkaCurrent = null;
 let restReceiver = null;
@@ -76,9 +77,7 @@ function startBackupScheduler() {
     lastScheduledMinute = minuteKey;
     scheduledBackupInFlight = true;
     try {
-      const result = await createBackup({ directory: settings.directory, scheduled: true });
-      const succeeded = result.rows.filter((row) => row.Status === 'Success').length;
-      await recordActivity('Automatic snapshot created', `${succeeded} of ${result.rows.length} subjects exported to ${result.path}.`);
+      await createBackup({ directory: settings.directory, scheduled: true });
     } catch (error) {
       await recordActivity('Automatic snapshot failed', error.message);
       mainWindow?.webContents.send('backup:schedule-event', { ok: false, message: error.message });
@@ -233,7 +232,26 @@ async function getSubjectDetails(code) {
   const subjects = subjectCache.length ? subjectCache : await getAllSubjects();
   const subject = subjects.find((item) => String(item.code || '') === String(code));
   if (!subject) throw new Error('Subject was not found. Refresh the HERTA subject list and try again.');
-  return makeSubjectDetails(subject);
+  const details = makeSubjectDetails(subject);
+  if (details.imageDataUrl) details.imageSource = 'HERTA subject record';
+  if (!details.imageDataUrl && subjectImageCache.has(details.code)) {
+    details.imageDataUrl = subjectImageCache.get(details.code);
+    details.imageSource = 'Previously exported NIST image';
+  }
+  if (!details.imageDataUrl) {
+    try {
+      const response = await authorizedJson(`/api/v1/subjects/${encodeURIComponent(details.code)}/export`, { method: 'POST', json: { format: 'nist' } });
+      const encoded = String(response.fileContent || '').replace(/\s+/g, '');
+      if (encoded && encoded.length <= Math.ceil(MAX_FILE_BYTES * 4 / 3) && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+        details.imageDataUrl = extractImageFromNistBytes(Buffer.from(encoded, 'base64'));
+        if (details.imageDataUrl) {
+          details.imageSource = 'HERTA NIST export';
+          subjectImageCache.set(details.code, details.imageDataUrl);
+        }
+      }
+    } catch { /* Keep the record view usable when this HERTA installation cannot export NIST files. */ }
+  }
+  return details;
 }
 
 async function profileCheck() {
@@ -253,7 +271,7 @@ async function profileCheck() {
   return results;
 }
 
-async function exportSubjects(codes, { backup = false, destinationDirectory = '' } = {}) {
+async function exportSubjects(codes, { backup = false, destinationDirectory = '', scheduled = false } = {}) {
   assertSignedIn();
   if (!Array.isArray(codes) || !codes.length) throw new Error('Select at least one subject to export.');
   if (codes.length > MAX_FILE_COUNT) throw new Error(`Export up to ${MAX_FILE_COUNT} subjects at a time.`);
@@ -311,7 +329,8 @@ async function exportSubjects(codes, { backup = false, destinationDirectory = ''
   if (archive.length > MAX_BACKUP_BYTES) throw new Error('Snapshot ZIP exceeds the 256 MiB limit.');
   await fs.writeFile(filePath, archive);
   const succeeded = rows.filter((row) => row.Status === 'Success').length;
-  await recordActivity(backup ? 'Snapshot created' : 'NIST export', `${succeeded} of ${rows.length} subject files exported.`);
+  const action = backup ? (scheduled ? 'Automatic snapshot created' : 'Snapshot created') : 'NIST export';
+  await recordActivity(action, `${succeeded} of ${rows.length} subject files exported${destinationDirectory ? ` to ${filePath}` : ''}.`);
   return { canceled: false, path: filePath, rows };
 }
 
@@ -322,7 +341,7 @@ async function createBackup({ directory = '', scheduled = false } = {}) {
     throw new Error(`This desktop snapshot supports up to ${MAX_FILE_COUNT} subjects per ZIP. HERTA currently has ${subjects.length}.`);
   }
   if (scheduled && !hertaSession?.token) throw new Error('Sign in to HERTA before the scheduled backup time.');
-  return exportSubjects(subjects.map((subject) => String(subject.code || '')).filter(Boolean), { backup: true, destinationDirectory: directory });
+  return exportSubjects(subjects.map((subject) => String(subject.code || '')).filter(Boolean), { backup: true, destinationDirectory: directory, scheduled });
 }
 
 async function checkHertaHealth() {
@@ -713,13 +732,14 @@ function registerIpc() {
     });
     const token = response.access_token || response.accessToken;
     if (!token) throw new Error('HERTA sign-in did not return an access token.');
+    subjectImageCache.clear();
     hertaSession = { baseUrl: normalized, verifyTls: verified, token: String(token) };
     await recordActivity('Signed in', 'A HERTA desktop session started.');
     return { authenticated: true, baseUrl: normalized };
   });
   handle('herta:logout', () => {
     if (hertaSession) void recordActivity('Signed out', 'The HERTA desktop session ended.');
-    hertaSession = null; selectedFiles.clear(); void pauseKafkaSource(); return { ok: true };
+    hertaSession = null; subjectImageCache.clear(); selectedFiles.clear(); void pauseKafkaSource(); return { ok: true };
   });
   handle('herta:subjects', async ({ query = '', group = '', offset = 0, limit = 40 } = {}) => {
     const subjects = await getAllSubjects();
@@ -735,7 +755,7 @@ function registerIpc() {
     const pageSize = Math.max(1, Math.min(100, Number(limit) || 40));
     const groups = [...new Set(subjects.map(subjectGroup).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     return {
-      subjects: matching.slice(start, start + pageSize).map((subject) => ({ ...summarizeSubject(subject), imageDataUrl: extractSubjectImage(subject, 48 * 1024) })),
+      subjects: matching.slice(start, start + pageSize).map((subject) => ({ ...summarizeSubject(subject), imageDataUrl: subjectImageCache.get(String(subject.code || '')) || extractSubjectImage(subject, 48 * 1024) })),
       count: matching.length,
       server_count: subjects.length,
       groups,
@@ -745,6 +765,7 @@ function registerIpc() {
   handle('herta:profiles', profileCheck);
   handle('herta:export', exportSubjects);
   handle('herta:backup-settings', () => readBackupSettings());
+  handle('herta:backup-preview', (cron) => nextCronDate(cron).toISOString());
   handle('herta:backup-settings-save', (settings) => saveBackupSettings(settings));
   handle('files:pick-backup-folder', async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: 'Choose automatic HERTA backup folder', properties: ['openDirectory', 'createDirectory'] });

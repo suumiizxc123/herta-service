@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { makeSubjectDetails, summarizeSubject, subjectGroup, extractSubjectImage } = require('../electron/subject-record');
+const { makeSubjectDetails, summarizeSubject, subjectGroup, extractSubjectImage, extractImageFromNistBytes } = require('../electron/subject-record');
 
 test('summarizes subject fields without returning the profile payload', () => {
   const subject = { code: 'SUB001', group: '1', profile: { fingers: 10 } };
@@ -31,4 +31,13 @@ test('extracts a supported image from an image field for the subject list', () =
   const result = extractSubjectImage({ code: 'SUB004', photo: png.toString('base64') });
   assert.match(result, /^data:image\/png;base64,/);
   assert.equal(extractSubjectImage({ image: Buffer.alloc(100 * 1024).toString('base64') }, 1024), '');
+});
+
+test('extracts an embedded PNG image from a NIST export byte stream', () => {
+  const png = Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    Buffer.from([0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]),
+  ]);
+  assert.match(extractImageFromNistBytes(Buffer.concat([Buffer.from('NIST record\n'), png, Buffer.from('trailer')])), /^data:image\/png;base64,/);
+  assert.equal(extractImageFromNistBytes(Buffer.from('NIST record without an image')), '');
 });

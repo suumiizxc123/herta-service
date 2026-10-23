@@ -1,4 +1,4 @@
-# HERTA Operations Desktop 1.3.0
+# HERTA Operations Desktop 1.6.0
 
 An Electron desktop application for the everyday HERTA BioCom workflows in the supplied PowerShell scripts. It runs locally on the operator's computer and connects to the existing HERTA API. It does not require a browser service, Python, Docker, or a separate user database.
 
@@ -9,6 +9,10 @@ An Electron desktop application for the everyday HERTA BioCom workflows in the s
 - Choose `.nist` files through a native file picker, preview the selection, and explicitly confirm imports by typing `IMPORT`.
 - Inspect profile length and JSON/Base64-like indicators without showing profile contents.
 - Create and restore local NIST snapshot ZIPs with a manifest and export report.
+- Schedule automatic NIST snapshot ZIPs into a selected folder with a five-field cron expression. The desktop must remain open and signed in to HERTA at the scheduled time.
+- Preview JPEG/PNG images found in subject data or in the subject's exported NIST record.
+
+Automatic backup cron example: `0 2 * * *` runs daily at 02:00 local time. Use `*/15 * * * *` for every 15 minutes while testing. Automatic backups run inside the desktop app, so they pause when the app is closed or signed out.
 - Check HERTA API responsiveness and review a local audit history of desktop operations.
 - Inspect subject metadata and reveal a subject's profile on demand.
 - Fetch NIST file envelopes from a configured REST JSON endpoint, receive authenticated NIST POSTs on a loopback-only REST listener, and connect to a Kafka topic to receive raw NIST bytes or JSON Base64 file envelopes.

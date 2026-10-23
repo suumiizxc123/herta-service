@@ -32,6 +32,34 @@ function findEmbeddedJpeg(bytes) {
   return end < 0 ? Buffer.alloc(0) : bytes.subarray(start, end + 2);
 }
 
+function extractImageFromNistBytes(bytes) {
+  const candidates = [];
+  const jpegStart = Buffer.from([0xff, 0xd8, 0xff]);
+  const jpegEnd = Buffer.from([0xff, 0xd9]);
+  for (let offset = 0; offset >= 0;) {
+    offset = bytes.indexOf(jpegStart, offset);
+    if (offset < 0) break;
+    const end = bytes.indexOf(jpegEnd, offset + jpegStart.length);
+    if (end > offset) candidates.push(bytes.subarray(offset, end + 2));
+    offset += jpegStart.length;
+  }
+  const pngStart = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const pngEnd = Buffer.from([0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]);
+  for (let offset = 0; offset >= 0;) {
+    offset = bytes.indexOf(pngStart, offset);
+    if (offset < 0) break;
+    const end = bytes.indexOf(pngEnd, offset + pngStart.length);
+    if (end >= 0) candidates.push(bytes.subarray(offset, end + pngEnd.length));
+    offset += pngStart.length;
+  }
+  candidates.sort((a, b) => b.length - a.length);
+  for (const candidate of candidates) {
+    const url = imageDataUrl(candidate);
+    if (url) return url;
+  }
+  return '';
+}
+
 function extractSubjectImage(subject, maxBytes = 1024 * 1024) {
   const parsed = {};
   for (const [key, value] of Object.entries(subject)) parsed[key] = value;
@@ -125,4 +153,4 @@ function makeSubjectDetails(subject, maxProfileChars = 512 * 1024) {
   };
 }
 
-module.exports = { profileToText, subjectGroup, extractSubjectImage, summarizeSubject, makeSubjectDetails };
+module.exports = { profileToText, subjectGroup, extractSubjectImage, extractImageFromNistBytes, summarizeSubject, makeSubjectDetails };

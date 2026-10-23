@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('herta', Object.freeze({
   exportSubjects: (codes) => ipcRenderer.invoke('herta:export', codes),
   createBackup: (options) => ipcRenderer.invoke('herta:backup', options),
   getBackupSettings: () => ipcRenderer.invoke('herta:backup-settings'),
+  previewBackupSchedule: (cron) => ipcRenderer.invoke('herta:backup-preview', cron),
   saveBackupSettings: (settings) => ipcRenderer.invoke('herta:backup-settings-save', settings),
   pickBackupFolder: () => ipcRenderer.invoke('files:pick-backup-folder'),
   checkHealth: () => ipcRenderer.invoke('herta:health'),
