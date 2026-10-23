@@ -134,7 +134,7 @@ async function configureBackupMount(app, directory) {
 
 async function recreateWorker(app) {
   const env = await environmentFile(app);
-  await run('docker', composeArgs(app, env.file, ['up', '-d', '--force-recreate', 'herta-worker']), { cwd: composeDirectory(app), timeout: 15 * 60 * 1000 });
+  await run('docker', composeArgs(app, env.file, ['up', '-d', '--build', '--force-recreate', 'herta-worker']), { cwd: composeDirectory(app), timeout: 15 * 60 * 1000 });
   return platformStatus(app);
 }
 

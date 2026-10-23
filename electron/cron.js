@@ -28,24 +28,33 @@ function parseCron(expression) {
   ];
 }
 
-function matchesCron(expression, date = new Date()) {
+function zonedParts(date, timeZone) {
+  if (!timeZone) return { minute: date.getMinutes(), hour: date.getHours(), day: date.getDate(), month: date.getMonth() + 1, weekday: date.getDay() };
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone, minute: 'numeric', hour: 'numeric', day: 'numeric', month: 'numeric', weekday: 'short', hourCycle: 'h23' }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return { minute: Number(values.minute), hour: Number(values.hour), day: Number(values.day), month: Number(values.month), weekday: ({ Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 })[values.weekday] };
+}
+
+function matchesCron(expression, date = new Date(), timeZone) {
   let fields;
   try { fields = parseCron(expression); } catch { return false; }
   const [minute, hour, day, month, weekday] = fields;
-  const dow = date.getDay();
+  let parts;
+  try { parts = zonedParts(date, timeZone); } catch { return false; }
+  const dow = parts.weekday;
   const weekdayMatches = weekday.values.has(dow) || (dow === 0 && weekday.values.has(7));
-  const dayMatches = day.values.has(date.getDate());
+  const dayMatches = day.values.has(parts.day);
   const calendarMatches = day.wildcard ? weekdayMatches : weekday.wildcard ? dayMatches : dayMatches || weekdayMatches;
-  return minute.values.has(date.getMinutes()) && hour.values.has(date.getHours()) && month.values.has(date.getMonth() + 1) && calendarMatches;
+  return minute.values.has(parts.minute) && hour.values.has(parts.hour) && month.values.has(parts.month) && calendarMatches;
 }
 
-function nextCronDate(expression, from = new Date()) {
+function nextCronDate(expression, from = new Date(), timeZone) {
   parseCron(expression);
   const next = new Date(from);
   next.setSeconds(0, 0);
   next.setMinutes(next.getMinutes() + 1);
   for (let i = 0; i < 366 * 24 * 60 * 2; i++, next.setMinutes(next.getMinutes() + 1)) {
-    if (matchesCron(expression, next)) return next;
+    if (matchesCron(expression, next, timeZone)) return next;
   }
   throw new Error('Could not find the next run time for this cron expression.');
 }

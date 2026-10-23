@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('herta', Object.freeze({
   getConnectorSettings: () => ipcRenderer.invoke('connectors:settings'),
   saveConnectorSettings: (settings) => ipcRenderer.invoke('connectors:settings-save', settings),
   getTelegramStatus: () => ipcRenderer.invoke('connectors:telegram-status'),
+  findTelegramChats: (botToken) => ipcRenderer.invoke('connectors:telegram-chats', botToken),
   testTelegram: () => ipcRenderer.invoke('connectors:telegram-test'),
   workerCall: (operation, payload) => ipcRenderer.invoke('platform:worker-call', operation, payload),
   listSubjects: (query) => ipcRenderer.invoke('herta:subjects', query),

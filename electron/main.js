@@ -36,11 +36,20 @@ let kafkaConsumer = null;
 let kafkaCurrent = null;
 let restReceiver = null;
 
-const defaultBackupSettings = () => ({ enabled: false, directory: '', cron: '0 2 * * *', retentionCount: 30 });
+const defaultBackupSettings = () => ({ enabled: false, directory: '', cron: '0 2 * * *', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', retentionCount: 30 });
 
 function sessionFile() { return path.join(app.getPath('userData'), 'herta-session.enc'); }
 function connectorSettingsFile() { return path.join(app.getPath('userData'), 'connector-settings.enc'); }
-const defaultConnectorSettings = () => ({ rest: { url: '', bearerToken: '', verifyTls: true }, kafka: { brokers: 'localhost:9092', topic: 'herta.nist', groupId: 'herta-operations-desktop', tls: false, verifyTls: true, mechanism: 'none', username: '', password: '', messageFormat: 'json-base64', partitions: '1', replicationFactor: '1' }, telegram: { botToken: '', chatId: '' } });
+const defaultConnectorSettings = () => ({ rest: { url: '', bearerToken: '', verifyTls: true }, kafka: { brokers: 'localhost:9092', topic: 'herta.nist', groupId: 'herta-operations-desktop', tls: false, verifyTls: true, mechanism: 'none', username: '', password: '', messageFormat: 'json-base64', partitions: '1', replicationFactor: '1' }, telegram: { botToken: '', chatId: '' }, connectors: [] });
+
+function telegramUserError(error) {
+  const message = String(error?.message || error || 'Telegram request failed.');
+  if (/can't use getupdates.*webhook|webhook is active|webhook.*getupdates/i.test(message)) return 'This bot already uses a Telegram webhook, so Telegram cannot discover chats through Find chats. Keep the existing webhook and enter the chat ID manually, or ask its owner before changing the bot setup.';
+  if (/terminated by other getupdates request|another getupdates request/i.test(message)) return 'Another app is polling updates for this bot. Stop that poller, then click Find chats again.';
+  if (/can't send messages to the bot|cannot send messages to the bot|bot can't message bots|chat id belongs to a bot|this bot account/i.test(message)) return 'Telegram cannot send a private message to another bot. The Chat ID must belong to a person or a group. Open your bot from your personal Telegram account, press Start or send /start, then use that person chat ID. For a group, add your bot and use the group chat ID.';
+  if (/chat not found/i.test(message)) return 'Telegram cannot find this chat yet. Open the bot from your personal account and send /start first, or add the bot to the group and send a message there. Then enter that person or group chat ID.';
+  return message.replace(/^Error invoking remote method '[^']+':\s*/i, '').replace(/^Error:\s*/i, '');
+}
 
 async function readConnectorSettings() {
   const fallback = defaultConnectorSettings();
@@ -49,14 +58,20 @@ async function readConnectorSettings() {
     const encrypted = await fs.readFile(connectorSettingsFile());
     const decrypted = await safeStorage.decryptStringAsync(encrypted);
     const saved = JSON.parse(decrypted.result);
-    return { ...fallback, ...saved, rest: { ...fallback.rest, ...saved.rest }, kafka: { ...fallback.kafka, ...saved.kafka }, telegram: { ...fallback.telegram, ...saved.telegram } };
+    let connectors = Array.isArray(saved.connectors) ? saved.connectors : null;
+    if (!connectors) {
+      connectors = [];
+      if (saved.rest?.url) connectors.push({ id: 'legacy-rest-source', name: 'REST source', type: 'rest', mode: 'pull', active: false, config: { ...fallback.rest, ...saved.rest }, createdAt: new Date().toISOString() });
+      if (saved.kafka && (saved.kafka.brokers !== fallback.kafka.brokers || saved.kafka.topic !== fallback.kafka.topic)) connectors.push({ id: 'legacy-kafka-source', name: 'Kafka source', type: 'kafka', mode: 'consumer', active: false, config: { ...fallback.kafka, ...saved.kafka }, createdAt: new Date().toISOString() });
+    }
+    return { ...fallback, ...saved, rest: { ...fallback.rest, ...saved.rest }, kafka: { ...fallback.kafka, ...saved.kafka }, telegram: { ...fallback.telegram, ...saved.telegram }, connectors };
   } catch { return fallback; }
 }
 
 async function saveConnectorSettings(settings) {
   if (!await safeStorage.isAsyncEncryptionAvailable()) throw new Error('Secure credential storage is unavailable on this computer.');
   const defaults = defaultConnectorSettings();
-  const next = { rest: { ...defaults.rest, ...settings?.rest }, kafka: { ...defaults.kafka, ...settings?.kafka }, telegram: { ...defaults.telegram, ...settings?.telegram } };
+  const next = { rest: { ...defaults.rest, ...settings?.rest }, kafka: { ...defaults.kafka, ...settings?.kafka }, telegram: { ...defaults.telegram, ...settings?.telegram }, connectors: Array.isArray(settings?.connectors) ? settings.connectors : [] };
   const file = connectorSettingsFile(); await fs.mkdir(path.dirname(file), { recursive: true });
   const encrypted = await safeStorage.encryptStringAsync(JSON.stringify(next));
   const temporary = `${file}.tmp`; await fs.writeFile(temporary, encrypted, { mode: 0o600 }); await fs.rename(temporary, file);
@@ -93,15 +108,35 @@ async function restoreHertaSession() {
   }
 }
 
+function connectorsForWorker(connectors, status) {
+  const localKafka = (status?.services || []).some((service) => service.Service === 'kafka' && /running|up/i.test(service.State || service.Status || ''));
+  return connectors.map((connector) => {
+    if (connector.type === 'rest' && connector.mode === 'pull') {
+      try {
+        const url = new URL(String(connector.config?.url || ''));
+        if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') url.hostname = 'host.docker.internal';
+        return { ...connector, config: { ...connector.config, url: url.toString() } };
+      } catch { return connector; }
+    }
+    if (connector.type !== 'kafka') return connector;
+    const brokers = String(connector.config?.brokers || '').split(',').map((value) => {
+      const broker = value.trim();
+      if (localKafka && /^(localhost|127\.0\.0\.1):19092$/.test(broker)) return 'kafka:9092';
+      return broker.replace(/^(localhost|127\.0\.0\.1):(\d+)$/, 'host.docker.internal:$2');
+    }).join(',');
+    return { ...connector, config: { ...connector.config, brokers } };
+  });
+}
+
 async function readBackupSettings() {
   try {
     const value = JSON.parse(await fs.readFile(path.join(app.getPath('userData'), 'backup-settings.json'), 'utf8'));
-    return { ...defaultBackupSettings(), ...value, enabled: Boolean(value.enabled), directory: typeof value.directory === 'string' ? value.directory : '', cron: typeof value.cron === 'string' ? value.cron : '0 2 * * *', retentionCount: Math.max(1, Math.min(365, Math.floor(Number(value.retentionCount) || 30))) };
+    return { ...defaultBackupSettings(), ...value, enabled: Boolean(value.enabled), directory: typeof value.directory === 'string' ? value.directory : '', cron: typeof value.cron === 'string' ? value.cron : '0 2 * * *', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', retentionCount: Math.max(1, Math.min(365, Math.floor(Number(value.retentionCount) || 30))) };
   } catch { return defaultBackupSettings(); }
 }
 
 async function saveBackupSettings(settings) {
-  const next = { enabled: Boolean(settings?.enabled), directory: String(settings?.directory || ''), cron: String(settings?.cron || '').trim(), retentionCount: Math.max(1, Math.min(365, Math.floor(Number(settings?.retentionCount) || 30))) };
+  const next = { enabled: Boolean(settings?.enabled), directory: String(settings?.directory || ''), cron: String(settings?.cron || '').trim(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', retentionCount: Math.max(1, Math.min(365, Math.floor(Number(settings?.retentionCount) || 30))) };
   parseCron(next.cron);
   if (next.directory) {
     next.directory = path.resolve(next.directory);
@@ -700,7 +735,7 @@ async function runImport({ ids, group = '0', confirmation = '' }) {
   for (const file of accepted) {
     const succeededFile = rows.find((row) => row.File === file.name && row.Status === 'HTTP_SUCCESS');
     if (!succeededFile || !file.workerInboxId) continue;
-    await DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(file.workerInboxId)}`, { method: 'DELETE' });
+    await DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(file.workerInboxId)}/complete`, { method: 'POST', body: {} });
   }
   await commitKafkaAcks().catch(() => {});
   await recordActivity('NIST import', `${succeeded} of ${rows.length} file imports succeeded.`);
@@ -765,8 +800,11 @@ function registerIpc() {
     const status = await DockerPlatform.startPlatform(app, options || {});
     if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);
     const settings = await readBackupSettings();
-      if (status.worker?.ok) await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: settings.enabled, cron: settings.cron, retentionCount: settings.retentionCount } }).catch(() => {});
     const connectors = await readConnectorSettings();
+    if (status.worker?.ok) {
+      await DockerPlatform.workerRequest(app, '/api/connectors', { method: 'PUT', body: connectorsForWorker(connectors.connectors, status) }).catch(() => {});
+      await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: settings.enabled, cron: settings.cron, timezone: settings.timezone, retentionCount: settings.retentionCount } }).catch(() => {});
+    }
     if (status.worker?.ok && connectors.telegram.botToken && connectors.telegram.chatId) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: connectors.telegram }).catch(() => {});
     return DockerPlatform.platformStatus(app);
   });
@@ -777,27 +815,42 @@ function registerIpc() {
       status: ['GET', '/api/status'], restFetch: ['POST', '/api/rest/fetch'], receiverStart: ['POST', '/api/receiver/start'],
       receiverStop: ['POST', '/api/receiver/stop'], inbox: ['GET', '/api/inbox'], kafkaStart: ['POST', '/api/kafka/start'],
       kafkaStop: ['POST', '/api/kafka/stop'], backupSettings: ['POST', '/api/backup/settings'], backupRun: ['POST', '/api/backup/run'],
+      queueHistory: ['GET', '/api/queue/history'], connectorLogs: ['GET', '/api/connectors/logs'],
+      restTest: ['POST', '/api/connectors/test'],
     };
     const endpoint = endpoints[operation];
     if (!endpoint) throw new Error('Unknown worker operation.');
-    return DockerPlatform.workerRequest(app, endpoint[1], { method: endpoint[0], body: payload, timeout: operation === 'backupRun' ? 15 * 60 * 1000 : 30000 });
+    return DockerPlatform.workerRequest(app, endpoint[1], { method: endpoint[0], body: payload, timeout: operation === 'backupRun' ? 2 * 60 * 60 * 1000 : 30000 });
   });
   handle('herta:session', () => ({ authenticated: Boolean(hertaSession?.token), baseUrl: hertaSession?.baseUrl || '' }));
   handle('connectors:settings', () => readConnectorSettings());
   handle('connectors:settings-save', async (settings) => {
+    const previous = await readConnectorSettings();
     const saved = await saveConnectorSettings(settings);
     const status = await DockerPlatform.platformStatus(app).catch(() => null);
-    if (status?.worker?.ok) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: saved.telegram }).catch(() => {});
+    if (status?.worker?.ok) await DockerPlatform.workerRequest(app, '/api/connectors', { method: 'PUT', body: connectorsForWorker(saved.connectors, status) });
+    const telegramChanged = previous.telegram.botToken !== saved.telegram.botToken || previous.telegram.chatId !== saved.telegram.chatId;
+    if (status?.worker?.ok && (settings?.forceTelegram || telegramChanged || (saved.telegram.botToken && !status.worker.telegram?.configured))) {
+      try { await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: saved.telegram }); }
+      catch (error) { throw new Error(telegramUserError(error)); }
+    }
     return saved;
   });
   handle('connectors:telegram-status', async () => {
     const status = await DockerPlatform.platformStatus(app);
     return status.worker?.ok ? DockerPlatform.workerRequest(app, '/api/telegram/status') : { configured: false, connected: false, error: 'Start the Docker worker first.' };
   });
+  handle('connectors:telegram-chats', async (botToken) => {
+    const status = await DockerPlatform.platformStatus(app);
+    if (!status.worker?.ok) throw new Error('Start the Docker worker before finding Telegram chats.');
+    try { return await DockerPlatform.workerRequest(app, '/api/telegram/chats', { method: 'POST', body: { botToken: String(botToken || '') } }); }
+    catch (error) { throw new Error(telegramUserError(error)); }
+  });
   handle('connectors:telegram-test', async () => {
     const settings = await readConnectorSettings();
     if (!settings.telegram.botToken || !settings.telegram.chatId) throw new Error('Enter and save the Telegram bot token and chat ID first.');
-    return DockerPlatform.workerRequest(app, '/api/telegram/test', { method: 'POST', body: {} });
+    try { return await DockerPlatform.workerRequest(app, '/api/telegram/test', { method: 'POST', body: {} }); }
+    catch (error) { throw new Error(telegramUserError(error)); }
   });
   handle('herta:login', async ({ baseUrl, username, password, verifyTls }) => {
     if (!String(username || '').trim() || !String(password || '')) throw new Error('Enter your HERTA username and password.');
@@ -822,7 +875,7 @@ function registerIpc() {
     void persistHertaSession(null);
     hertaSession = null; subjectImageCache.clear(); selectedFiles.clear(); void pauseKafkaSource(); return { ok: true };
   });
-  handle('herta:subjects', async ({ query = '', group = '', offset = 0, limit = 40 } = {}) => {
+  handle('herta:subjects', async ({ query = '', group = '', offset = 0, limit = 40, includeCodes = false } = {}) => {
     const subjects = await getAllSubjects();
     const normalized = String(query).trim().toLocaleLowerCase();
     const normalizedGroup = String(group || '');
@@ -840,6 +893,7 @@ function registerIpc() {
       count: matching.length,
       server_count: subjects.length,
       groups,
+      ...(includeCodes ? { matchingCodes: matching.slice(0, MAX_FILE_COUNT).map((subject) => String(subject.code || '')).filter(Boolean) } : {}),
     };
   });
   handle('herta:subject-detail', getSubjectDetails);
@@ -854,8 +908,11 @@ function registerIpc() {
     if (status?.worker?.ok && saved.directory) {
       status = await DockerPlatform.recreateWorker(app);
       if (hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession);
+      const connectors = await readConnectorSettings();
+      if (status.worker?.ok) await DockerPlatform.workerRequest(app, '/api/connectors', { method: 'PUT', body: connectorsForWorker(connectors.connectors, status) }).catch(() => {});
+      if (status.worker?.ok && connectors.telegram.botToken && connectors.telegram.chatId) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: connectors.telegram }).catch(() => {});
     }
-      if (status?.worker?.ok) await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: saved.enabled, cron: saved.cron, retentionCount: saved.retentionCount } });
+      if (status?.worker?.ok) await DockerPlatform.workerRequest(app, '/api/backup/settings', { method: 'POST', body: { enabled: saved.enabled, cron: saved.cron, timezone: saved.timezone, retentionCount: saved.retentionCount } });
     return saved;
   });
   handle('files:pick-backup-folder', async () => {
@@ -864,10 +921,15 @@ function registerIpc() {
   });
   handle('herta:backup', async (options) => {
     const status = await DockerPlatform.platformStatus(app).catch(() => null);
-    if (!status?.worker?.ok) return createBackup(options);
-    const result = await DockerPlatform.workerRequest(app, '/api/backup/run', { method: 'POST', body: {}, timeout: 15 * 60 * 1000 });
+    if (!status?.worker?.ok) {
+      const settings = await readConnectorSettings();
+      if (settings.connectors.some((connector) => connector.type === 'postgres' && connector.active)) throw new Error('Start the Docker worker before running the configured PostgreSQL full backup.');
+      return createBackup(options);
+    }
+    const result = await DockerPlatform.workerRequest(app, '/api/backup/run', { method: 'POST', body: {}, timeout: 2 * 60 * 60 * 1000 });
     const destination = status.backupPath || options?.directory || '';
-    return { ...result, path: destination ? path.join(destination, path.basename(result.path || '')) : result.path };
+    const localPath = (file) => destination && file ? path.join(destination, path.basename(file)) : file;
+    return { ...result, path: localPath(result.path), paths: (result.paths || []).map(localPath), databaseBackups: (result.databaseBackups || []).map((item) => ({ ...item, path: localPath(item.path) })) };
   });
   handle('herta:health', checkHertaHealth);
   handle('herta:audit', async () => {
@@ -907,7 +969,7 @@ function registerIpc() {
     return output;
   });
   handle('source:inbox-discard', (id) => DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(id)}`, { method: 'DELETE' }));
-  handle('source:rest-receiver-start', () => DockerPlatform.workerRequest(app, '/api/receiver/start', { method: 'POST', body: {} }));
+  handle('source:rest-receiver-start', (config = {}) => DockerPlatform.workerRequest(app, '/api/receiver/start', { method: 'POST', body: config }));
   handle('source:rest-receiver-stop', () => DockerPlatform.workerRequest(app, '/api/receiver/stop', { method: 'POST', body: {} }));
   handle('files:pick-import', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -976,10 +1038,21 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
   registerIpc();
   await restoreHertaSession();
-  const initialStatus = await DockerPlatform.platformStatus(app).catch(() => null);
+  let initialStatus = await DockerPlatform.platformStatus(app).catch(() => null);
+  let rebuildWorker = false;
+  if (initialStatus?.worker?.ok) {
+    try { await DockerPlatform.workerRequest(app, '/api/queue/history'); }
+    catch { rebuildWorker = true; }
+  }
+  if (rebuildWorker) {
+    const running = (name) => (initialStatus.services || []).some((service) => service.Service === name && /running|up/i.test(service.State || service.Status || ''));
+    initialStatus = await DockerPlatform.startPlatform(app, { localKafka: running('kafka'), search: running('elasticsearch') }).catch((error) => ({ ...initialStatus, worker: { ok: false, error: error.message } }));
+    if (initialStatus.worker?.ok && hertaSession) await DockerPlatform.setWorkerSession(app, hertaSession).catch(() => {});
+  }
   const initialConnectors = await readConnectorSettings();
-  if (initialStatus?.worker?.ok && initialConnectors.telegram.botToken && initialConnectors.telegram.chatId) {
-    await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: initialConnectors.telegram }).catch(() => {});
+  if (initialStatus?.worker?.ok) {
+    await DockerPlatform.workerRequest(app, '/api/connectors', { method: 'PUT', body: connectorsForWorker(initialConnectors.connectors, initialStatus) }).catch(() => {});
+    if (initialConnectors.telegram.botToken && initialConnectors.telegram.chatId) await DockerPlatform.workerRequest(app, '/api/telegram/config', { method: 'POST', body: initialConnectors.telegram }).catch(() => {});
   }
   await createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

@@ -62,9 +62,11 @@ button, input { font: inherit; }
 .sidebar-link:hover, .sidebar-link[data-active="true"] { color: #173b68; background: #edf3f8; }
 .sidebar-link[data-active="true"] { box-shadow: inset 2px 0 #5f8db2; }
 .sidebar-link { transition: color 160ms ease, background-color 160ms ease, box-shadow 160ms ease; }
-.page-transition { animation: page-enter 220ms cubic-bezier(.2,.75,.25,1) both; }
-@keyframes page-enter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
-@media (prefers-reduced-motion: reduce) { .page-transition { animation: none; } .sidebar-link { transition: none; } }
+.page-transition { animation: page-enter 160ms ease-out both; }
+.selection-dock { animation: dock-enter 180ms cubic-bezier(.2,.75,.25,1) both; }
+@keyframes page-enter { from { opacity: 0; } to { opacity: 1; } }
+@keyframes dock-enter { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .page-transition, .selection-dock { animation: none; } .sidebar-link { transition: none; } }
 .eyebrow { color: #73869c; font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .scrollbar-thin { scrollbar-width: thin; scrollbar-color: #c8d1dc transparent; }

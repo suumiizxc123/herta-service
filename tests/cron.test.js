@@ -19,3 +19,11 @@ test('rejects invalid cron expressions and finds the next matching minute', () =
   assert.equal(next.getHours(), 2);
   assert.equal(next.getMinutes(), 0);
 });
+
+test('matches and previews schedules in the configured desktop time zone', () => {
+  const before = new Date('2026-10-23T17:59:00.000Z');
+  const scheduled = new Date('2026-10-23T18:00:00.000Z');
+  assert.equal(matchesCron('0 2 * * *', scheduled, 'Asia/Ulaanbaatar'), true);
+  assert.equal(matchesCron('0 2 * * *', scheduled, 'UTC'), false);
+  assert.equal(nextCronDate('0 2 * * *', before, 'Asia/Ulaanbaatar').toISOString(), scheduled.toISOString());
+});

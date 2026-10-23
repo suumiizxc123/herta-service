@@ -1,6 +1,7 @@
 FROM node:22-alpine
 WORKDIR /app
 COPY platform/worker/package.json ./package.json
+RUN apk add --no-cache postgresql-client
 RUN npm install --omit=dev --no-audit --no-fund
 RUN mkdir -p /data /backups && chown -R node:node /app /data /backups
 COPY platform/worker/server.js ./platform/worker/server.js
