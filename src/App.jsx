@@ -287,10 +287,9 @@ export default function App() {
   }, [invoke]);
 
   useEffect(() => {
-    if (view === 'health') refreshHealth();
-    if (view === 'activity') refreshAudit();
-    if (view === 'backups') refreshAudit();
-    if (view === 'integrations') refreshInbox();
+    if (view === 'health' || view === 'overview') refreshHealth();
+    if (view === 'activity' || view === 'backups' || view === 'overview') refreshAudit();
+    if (view === 'integrations' || view === 'overview') refreshInbox();
   }, [view, refreshHealth, refreshAudit, refreshInbox]);
 
   useEffect(() => {
@@ -298,6 +297,14 @@ export default function App() {
     const timer = window.setInterval(refreshInbox, 1800);
     return () => window.clearInterval(timer);
   }, [view, refreshInbox]);
+
+  useEffect(() => {
+    if (view !== 'overview') return undefined;
+    const timer = window.setInterval(() => {
+      refreshHealth(); refreshAudit(); refreshInbox();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [view, refreshHealth, refreshAudit, refreshInbox]);
 
   const fetchRest = async () => {
     setLoading(true); setIntegrationMessage('');
@@ -364,11 +371,11 @@ export default function App() {
               : view === 'integrations' ? <Button variant="outline" onClick={refreshInbox}><RefreshCw /> Refresh inbox</Button>
               : <Button variant="outline" onClick={() => loadSubjects().catch(() => {})} disabled={loading}><RefreshCw className={loading ? 'animate-spin' : ''} /> Refresh</Button>;
 
-  const topMetric = useMemo(() => [
-    { label: 'Total subjects', value: serverCount.toLocaleString(), icon: Users, note: 'In HERTA' },
-    { label: 'Selected', value: selected.size.toLocaleString(), icon: CheckCircle2, note: 'Ready to export' },
-    { label: 'Import queue', value: files.length.toLocaleString(), icon: FileArchive, note: 'NIST files' },
-  ], [serverCount, selected.size, files.length]);
+  const dashboardStats = useMemo(() => ({
+    failedInbox: sourceInbox.filter((item) => item.error).length,
+    waitingInbox: sourceInbox.filter((item) => !item.error).length,
+    latestActivity: auditEvents[0] || null,
+  }), [sourceInbox, auditEvents]);
 
   if (!session.authenticated) return <Login config={config} setConfig={setConfig} notice={notice} loading={loading} onSubmit={connect} />;
 
@@ -385,11 +392,11 @@ export default function App() {
       <div className="mt-auto">
         <Separator className="mb-4" />
         <div className="rounded-xl border border-slate-200 bg-white p-3.5">
-          <div className="flex items-center gap-2 text-xs font-medium text-slate-800"><span className="size-2 rounded-full bg-emerald-500 ring-4 ring-emerald-100" /> HERTA connected</div>
+          <div className="flex items-center gap-2 text-xs font-medium text-slate-800"><span className={`size-2 rounded-full ring-4 ${health?.ok ? 'bg-emerald-500 ring-emerald-100' : healthError ? 'bg-rose-500 ring-rose-100' : 'bg-amber-400 ring-amber-100'}`} />{health?.ok ? 'HERTA healthy' : healthError ? 'HERTA unavailable' : 'Checking HERTA'}</div>
           <p className="mt-2 truncate text-[11px] text-slate-500" title={session.baseUrl}>{session.baseUrl}</p>
         </div>
         <Button variant="ghost" className="mt-3 w-full justify-start text-slate-600 hover:bg-slate-100 hover:text-slate-900" onClick={signOut}><LogOut /> Sign out</Button>
-        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.6.0'}</div>
+        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.7.0'}</div>
       </div>
     </aside>
 
@@ -401,18 +408,51 @@ export default function App() {
 
       <div key={view} className="page-transition mx-auto max-w-[1320px] px-8 py-8">
         {view === 'overview' && <>
-          <div className="mb-7 flex items-end justify-between"><div><p className="eyebrow">Workspace</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">Overview</h1><p className="mt-1 text-sm text-muted-foreground">Your HERTA data operations, in one place.</p></div><Badge variant="outline" className="gap-1.5 border-emerald-200 bg-emerald-50 px-3 py-1.5 text-emerald-700"><span className="size-1.5 rounded-full bg-emerald-500" /> Connected</Badge></div>
-          <div className="grid gap-4 md:grid-cols-3">{topMetric.map(({ label, value, icon: Icon, note }) => <Card key={label}><CardContent className="flex items-start justify-between p-5"><div><div className="text-sm text-muted-foreground">{label}</div><div className="mt-3 text-[28px] font-semibold tracking-tight">{value}</div><div className="mt-1 text-xs text-muted-foreground">{note}</div></div><div className="rounded-lg bg-[#edf3f8] p-2.5 text-[#315a80]"><Icon className="size-5" /></div></CardContent></Card>)}</div>
-          <div className="mt-6 grid gap-5 xl:grid-cols-[1.3fr_.8fr]">
-            <Card><CardHeader className="flex-row items-center justify-between space-y-0"><div><CardTitle className="text-base">Quick actions</CardTitle><CardDescription className="mt-1">Pick up where your work needs you.</CardDescription></div><Activity className="size-5 text-slate-400" /></CardHeader><CardContent className="grid gap-3 sm:grid-cols-2">
-              <ActionTile icon={Users} title="Browse subjects" description="Search and export HERTA records" onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} />
-              <ActionTile icon={Upload} title="Import NIST files" description="Preview files before sending" onClick={() => setView('import')} />
-              <ActionTile icon={Fingerprint} title="Check profiles" description="Review profile metadata safely" onClick={() => setView('profiles')} />
-              <ActionTile icon={ArrowDownToLine} title="Export records" description="Create a NIST archive and CSV" onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} />
-            </CardContent></Card>
-            <Card><CardHeader><CardTitle className="text-base">Connection</CardTitle><CardDescription>Your session is active for this desktop window.</CardDescription></CardHeader><CardContent className="space-y-4"><div className="flex items-center gap-3 rounded-lg border bg-slate-50/70 p-3.5"><div className="flex size-9 items-center justify-center rounded-lg bg-white text-[#315a80] shadow-sm"><Cloud className="size-[18px]" /></div><div className="min-w-0"><p className="text-xs font-medium">HERTA API</p><p className="mt-1 truncate text-xs text-muted-foreground">{session.baseUrl}</p></div><CheckCircle2 className="ml-auto size-4 shrink-0 text-emerald-600" /></div><div className="flex gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Credentials and the access token are held in memory for this session.</span></div><Separator /><div className="flex items-center justify-between text-xs"><span className="text-muted-foreground">Subject records</span><span className="font-medium">{serverCount.toLocaleString()} available</span></div></CardContent></Card>
+          <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">Operations center</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">System overview</h1><p className="mt-1 text-sm text-muted-foreground">Live status of this desktop, its HERTA connection, data intake, and backups.</p></div><div className="flex items-center gap-2"><Badge variant="outline" className={`gap-1.5 px-3 py-1.5 ${health?.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : healthError ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}><span className={`size-1.5 rounded-full ${health?.ok ? 'bg-emerald-500' : healthError ? 'bg-rose-500' : 'bg-amber-500'}`} />{health?.ok ? 'HERTA healthy' : healthError ? 'HERTA unavailable' : 'Checking HERTA'}</Badge><Button variant="outline" size="sm" onClick={() => { refreshHealth(); refreshAudit(); refreshInbox(); }}><RefreshCw className="size-3.5" /> Refresh</Button></div></div>
+
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <DashboardMetric icon={HeartPulse} label="HERTA API" value={health?.ok ? `${health.latencyMs} ms` : healthError ? 'Unavailable' : 'Checking…'} detail={health?.ok ? 'Latest response time' : healthError ? 'Check connection settings' : 'Running health check'} tone={health?.ok ? 'green' : healthError ? 'red' : 'amber'} />
+            <DashboardMetric icon={Users} label="Subjects" value={(health?.subjectCount ?? serverCount).toLocaleString()} detail="Records visible in HERTA" tone="blue" />
+            <DashboardMetric icon={FileArchive} label="Intake inbox" value={dashboardStats.waitingInbox.toLocaleString()} detail={dashboardStats.failedInbox ? `${dashboardStats.failedInbox} item(s) need attention` : 'REST / Kafka files waiting'} tone={dashboardStats.failedInbox ? 'amber' : 'violet'} />
+            <DashboardMetric icon={ArchiveRestore} label="Automatic backup" value={backupSettings.enabled && backupSettings.directory ? 'Scheduled' : 'Not active'} detail={backupSettings.enabled && backupSettings.directory ? frequencyLabel[backupFrequency] || frequencyLabel.custom : 'Choose destination and enable'} tone={backupSettings.enabled && backupSettings.directory ? 'green' : 'slate'} />
           </div>
-          <Card className="mt-5"><CardHeader className="pb-3"><CardTitle className="text-base">Recent subjects</CardTitle><CardDescription>Open a subject to inspect its HERTA fields and profile.</CardDescription></CardHeader><CardContent className="pt-0"><SubjectTable subjects={subjects.slice(0, 5)} onOpenDetails={showSubjectDetails} empty="Refresh to load subjects from HERTA." /></CardContent></Card>
+
+          <div className="mt-5 grid gap-5 xl:grid-cols-[1.45fr_.85fr]">
+            <Card className="overflow-hidden border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><div className="flex items-center justify-between gap-3"><div><CardTitle className="text-base">Data intake pipeline</CardTitle><CardDescription className="mt-1">Current desktop path from source to HERTA.</CardDescription></div><Badge variant="secondary" className="bg-blue-50 text-blue-700">NIST workflow</Badge></div></CardHeader><CardContent className="p-5">
+              <div className="grid gap-2 md:grid-cols-4">{[
+                { n: '01', name: 'Sources', desc: 'REST · Kafka · local file', icon: Radio, color: 'blue' },
+                { n: '02', name: 'Basic checks', desc: 'Format · size · file safety', icon: FileCheck2, color: 'violet' },
+                { n: '03', name: 'Review inbox', desc: `${dashboardStats.waitingInbox} ready · ${dashboardStats.failedInbox} flagged`, icon: Eye, color: 'amber' },
+                { n: '04', name: 'HERTA import', desc: 'Operator confirms each batch', icon: ArrowRight, color: 'green' },
+              ].map(({ n, name, desc, icon: Icon, color }, index) => <div key={n} className="relative rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">{index < 3 && <div className="absolute -right-2.5 top-7 z-10 hidden size-5 items-center justify-center rounded-full border bg-white text-slate-400 md:flex"><ChevronRight className="size-3" /></div>}<div className="flex items-center justify-between"><span className="text-[10px] font-semibold tracking-widest text-slate-400">{n}</span><span className={`flex size-8 items-center justify-center rounded-lg ${toneClasses(color)}`}><Icon className="size-4" /></span></div><div className="mt-3 text-xs font-semibold text-slate-800">{name}</div><div className="mt-1 text-[10px] leading-4 text-slate-500">{desc}</div></div>)}</div>
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dashed border-slate-300 px-4 py-3"><div className="min-w-0"><div className="text-xs font-medium text-slate-700">Normalization and field mapping</div><div className="mt-1 text-[11px] text-slate-500">Basic NIST intake is available; configurable schemas, mapping rules, and routing policies are not yet implemented.</div></div><Badge variant="outline" className="shrink-0 bg-white text-slate-600">Platform gap</Badge></div>
+            </CardContent></Card>
+
+            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Connection & session</CardTitle><CardDescription className="mt-1">Live check for this signed-in desktop session.</CardDescription></CardHeader><CardContent className="space-y-3 p-5">
+              <DashboardStatus icon={Cloud} title="HERTA API" detail={session.baseUrl} state={health?.ok ? 'Healthy' : healthError ? 'Unavailable' : 'Checking'} tone={health?.ok ? 'green' : healthError ? 'red' : 'amber'} />
+              <DashboardStatus icon={Radio} title="REST receiver" detail={receiver.running ? `Listening on 127.0.0.1:${receiver.port}` : 'Available to start in Integrations'} state={receiver.running ? 'Listening' : 'Ready'} tone={receiver.running ? 'green' : 'slate'} />
+              <DashboardStatus icon={Activity} title="Kafka consumer" detail={kafkaListening ? `${kafkaSource.topic} · ${kafkaSource.brokers}` : kafkaStatus ? `Broker checked · ${kafkaSource.topic}` : 'Configure a broker in Integrations'} state={kafkaListening ? 'Receiving' : kafkaStatus ? 'Broker verified' : 'Not tested'} tone={kafkaListening || kafkaStatus ? 'green' : 'slate'} />
+              <div className="rounded-lg bg-slate-50 px-3 py-2.5 text-[11px] leading-5 text-slate-600"><ShieldCheck className="mr-1.5 inline size-3.5 text-[#53799f]" />Login token and connector credentials are held in app memory for this session.</div>
+            </CardContent></Card>
+          </div>
+
+          <div className="mt-5 grid gap-5 xl:grid-cols-[1.15fr_.85fr]">
+            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="flex-row items-center justify-between space-y-0 border-b bg-white px-5 py-4"><div><CardTitle className="text-base">Backup & resilience</CardTitle><CardDescription className="mt-1">Desktop snapshot status and platform capabilities.</CardDescription></div><Button variant="outline" size="sm" onClick={() => setView('backups')}>Manage backup <ArrowRight /></Button></CardHeader><CardContent className="grid gap-3 p-5 sm:grid-cols-2">
+              <div className="rounded-xl border border-slate-200 p-3.5"><div className="flex items-center gap-2 text-xs font-semibold text-slate-800"><ArchiveRestore className="size-4 text-[#53799f]" />Local ZIP snapshot</div><div className="mt-2 text-[11px] leading-5 text-slate-500">{backupSettings.directory ? <span className="break-all">{backupSettings.directory}</span> : 'No destination selected.'}</div><div className="mt-2 text-[10px] text-slate-500">{lastSnapshot ? `Last: ${new Date(lastSnapshot.at).toLocaleString()}` : 'No snapshot recorded yet'}</div></div>
+              <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-3.5"><div className="flex items-center gap-2 text-xs font-semibold text-amber-900"><CircleHelp className="size-4" />Recovery boundary</div><div className="mt-2 text-[11px] leading-5 text-amber-800">Scheduled jobs run only while this app is open and signed in. Retention, S3/MinIO, off-site archive, failover, and restore drills are not configured.</div></div>
+            </CardContent></Card>
+            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Platform readiness</CardTitle><CardDescription className="mt-1">Capabilities that need server-side services.</CardDescription></CardHeader><CardContent className="space-y-0 p-5">
+              <ReadinessRow title="CDC replication & mirror" detail="Debezium, Kafka Connect, replication lag" />
+              <ReadinessRow title="Metrics & alerting" detail="Prometheus, Grafana, delivery notifications" />
+              <ReadinessRow title="Connector plugin framework" detail="Database connectors, mapping, and routing" />
+              <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[10px] leading-4 text-slate-500">These are shown as not configured; this desktop client does not provision or monitor those servers.</div>
+            </CardContent></Card>
+          </div>
+
+          <div className="mt-5 grid gap-5 xl:grid-cols-[1.2fr_.8fr]">
+            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="flex-row items-center justify-between space-y-0 border-b bg-white px-5 py-4"><div><CardTitle className="text-base">Recent activity</CardTitle><CardDescription className="mt-1">Latest locally recorded operations.</CardDescription></div><Button variant="ghost" size="sm" onClick={() => setView('activity')}>View audit log <ArrowRight /></Button></CardHeader><CardContent className="p-5">{auditEvents.length ? <div className="space-y-3">{auditEvents.slice(0, 4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3"><span className="mt-1 flex size-7 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500"><Activity className="size-3.5" /></span><div className="min-w-0 flex-1"><div className="text-xs font-medium text-slate-800">{event.action}</div><div className="mt-0.5 truncate text-[10px] text-slate-500">{event.summary || 'Operation recorded'}</div></div><time className="shrink-0 text-[10px] text-slate-400">{new Date(event.at).toLocaleString()}</time></div>)}</div> : <div className="rounded-lg border border-dashed py-7 text-center text-xs text-slate-500">No recent activity recorded on this desktop.</div>}</CardContent></Card>
+            <Card className="border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Go to work</CardTitle><CardDescription className="mt-1">Open a workspace without hunting through menus.</CardDescription></CardHeader><CardContent className="grid gap-2 p-4 sm:grid-cols-2 xl:grid-cols-1"><ActionTile icon={Users} title="Subjects" description={`${serverCount.toLocaleString()} records · groups and profiles`} onClick={() => { setView('subjects'); loadSubjects().catch(() => {}); }} /><ActionTile icon={Radio} title="Integrations" description="REST, Kafka, and incoming file inbox" onClick={() => setView('integrations')} /><ActionTile icon={Upload} title="Import NIST" description={`${files.length} file(s) currently in the import queue`} onClick={() => setView('import')} /></CardContent></Card>
+          </div>
         </>}
 
         {view === 'subjects' && <>
@@ -514,7 +554,7 @@ function Login({ config, setConfig, notice, loading, onSubmit }) {
     <section className="hidden w-[48%] flex-col justify-between border-r border-slate-200 bg-[#f3f6f9] px-12 py-10 text-slate-800 lg:flex">
       <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><Fingerprint className="size-6" /></div><div><div className="font-semibold tracking-wide">HERTA</div><div className="text-[11px] text-slate-500">Operations desktop</div></div></div>
       <div className="max-w-[500px] pb-6"><div className="mb-6 flex size-12 items-center justify-center rounded-2xl border border-slate-200 bg-white"><Database className="size-6 text-[#53799f]" /></div><div className="text-[34px] font-semibold leading-[1.17] tracking-tight">Biometric operations, <span className="text-[#53799f]">thoughtfully connected.</span></div><p className="mt-5 max-w-[420px] text-sm leading-6 text-slate-600">A secure desktop workspace for HERTA subject records, NIST file operations, and profile metadata checks.</p><div className="mt-9 grid grid-cols-3 gap-3"><Feature icon={Users} label="Subjects" /><Feature icon={FileArchive} label="NIST files" /><Feature icon={ShieldCheck} label="Local session" /></div></div>
-      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.6.0'}</div>
+      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.7.0'}</div>
     </section>
     <section className="flex flex-1 items-center justify-center px-6 py-10">
       <div className="w-full max-w-[410px]">
@@ -535,6 +575,10 @@ function Login({ config, setConfig, notice, loading, onSubmit }) {
 }
 
 function PageHeading({ eyebrow, title, description, action }) { return <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="eyebrow">{eyebrow}</p><h1 className="mt-2 text-[27px] font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{description}</p></div>{action}</div>; }
+function toneClasses(tone) { return ({ blue: 'bg-blue-50 text-blue-700', violet: 'bg-violet-50 text-violet-700', amber: 'bg-amber-50 text-amber-700', green: 'bg-emerald-50 text-emerald-700', red: 'bg-rose-50 text-rose-700', slate: 'bg-slate-100 text-slate-600' })[tone] || 'bg-slate-100 text-slate-600'; }
+function DashboardMetric({ icon: Icon, label, value, detail, tone = 'blue' }) { return <Card className="border-slate-200/80 shadow-sm"><CardContent className="flex min-h-[122px] items-start justify-between gap-3 p-4"><div className="min-w-0"><div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">{label}</div><div className="mt-2 truncate text-[23px] font-semibold tracking-tight text-slate-900">{value}</div><div className="mt-1 truncate text-[10px] text-slate-500">{detail}</div></div><div className={`flex size-9 shrink-0 items-center justify-center rounded-xl ${toneClasses(tone)}`}><Icon className="size-[18px]" /></div></CardContent></Card>; }
+function DashboardStatus({ icon: Icon, title, detail, state, tone = 'slate' }) { return <div className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-2.5"><div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-slate-50 text-slate-600"><Icon className="size-4" /></div><div className="min-w-0 flex-1"><div className="text-xs font-medium text-slate-800">{title}</div><div className="mt-0.5 truncate text-[10px] text-slate-500" title={detail}>{detail}</div></div><Badge variant="secondary" className={`shrink-0 text-[9px] ${toneClasses(tone)}`}>{state}</Badge></div>; }
+function ReadinessRow({ title, detail }) { return <div className="flex items-start gap-3 border-b border-slate-100 py-3 last:border-0"><span className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-500"><CircleHelp className="size-3" /></span><div className="min-w-0 flex-1"><div className="text-xs font-medium text-slate-700">{title}</div><div className="mt-0.5 text-[10px] text-slate-500">{detail}</div></div><Badge variant="outline" className="shrink-0 text-[9px] text-slate-500">Not configured</Badge></div>; }
 function ActionTile({ icon: Icon, title, description, onClick }) { return <button onClick={onClick} className="group flex items-center gap-3 rounded-xl border p-4 text-left transition-colors hover:border-[#c6d6e5] hover:bg-[#f8fafc]"><div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-[#edf3f8] text-[#315a80]"><Icon className="size-[18px]" /></div><div className="min-w-0 flex-1"><div className="text-sm font-medium">{title}</div><div className="mt-1 text-xs text-muted-foreground">{description}</div></div><ArrowRight className="size-4 text-slate-300 transition-transform group-hover:translate-x-0.5 group-hover:text-[#315a80]" /></button>; }
 function Feature({ icon: Icon, label }) { return <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm"><Icon className="size-4 text-[#53799f]" /><div className="mt-2 text-[11px] text-slate-600">{label}</div></div>; }
 function HealthMetric({ label, value }) { return <div className="rounded-lg border bg-white p-3.5"><div className="text-xs text-muted-foreground">{label}</div><div className="mt-2 truncate text-base font-semibold">{value}</div></div>; }
@@ -558,3 +602,4 @@ function SubjectTable({ subjects, selected, onSelect, onOpenDetails, loading, em
 function ImportTable({ rows }) { return <Table><TableHeader><TableRow><TableHead>File</TableHead><TableHead>Code</TableHead><TableHead>Status</TableHead><TableHead>Size</TableHead><TableHead>Message</TableHead></TableRow></TableHeader><TableBody>{rows.map((row, index) => <TableRow key={`${row.File}-${index}`}><TableCell className="max-w-[200px] truncate font-medium">{row.File}</TableCell><TableCell className="mono">{row.Code}</TableCell><TableCell><Badge variant={['Failed', 'Rejected', 'HTTP_ERROR'].includes(row.Status) ? 'destructive' : row.Status === 'DryRun' ? 'outline' : 'secondary'}>{row.Status}</Badge></TableCell><TableCell>{formatSize(Number(row.Bytes) || 0)}</TableCell><TableCell className="max-w-[240px] text-xs text-muted-foreground">{row.Message}</TableCell></TableRow>)}</TableBody></Table>; }
 function EmptyRow({ cols, text }) { return <TableRow><TableCell colSpan={cols} className="h-28 text-center text-sm text-muted-foreground">{text}</TableCell></TableRow>; }
 function InlineError({ text }) { return <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800">{text}</div>; }
+

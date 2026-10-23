@@ -1,4 +1,4 @@
-# HERTA Operations Desktop 1.6.0
+# HERTA Operations Desktop 1.7.0
 
 An Electron desktop application for the everyday HERTA BioCom workflows in the supplied PowerShell scripts. It runs locally on the operator's computer and connects to the existing HERTA API. It does not require a browser service, Python, Docker, or a separate user database.
 
@@ -38,3 +38,4 @@ pnpm dev
 ## Build a desktop installer
 
 On Windows, run `pnpm run dist:win`. The installer and portable executable are written to `release/`. On macOS use `pnpm run dist:mac`; on Linux use `pnpm run dist:linux`. Build each platform on that platform.
+
