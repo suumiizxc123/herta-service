@@ -9,6 +9,7 @@ const { unzipSync } = require('fflate');
 const { Kafka, logLevel } = require('kafkajs');
 const { createZip, inspectBackupArchive } = require('./backup-archive');
 const { MAX_FILES, safeNistName, normalizeNistSourcePayload } = require('./source-files');
+const { profileToText, subjectGroup, extractSubjectImage, summarizeSubject, makeSubjectDetails } = require('./subject-record');
 
 const APP_PAGE = path.resolve(__dirname, '../dist/renderer/index.html');
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
@@ -157,12 +158,6 @@ function safeFilename(value) {
   return String(value).replace(/[^\p{L}\p{N}_.-]/gu, '_').slice(0, 100) || 'subject';
 }
 
-function profileToText(profile) {
-  if (profile == null) return '';
-  if (typeof profile === 'string') return profile;
-  try { return JSON.stringify(profile); } catch { return String(profile); }
-}
-
 async function getAllSubjects() {
   const subjects = [];
   let offset = 0;
@@ -180,37 +175,12 @@ async function getAllSubjects() {
   return subjects;
 }
 
-function summarizeSubject(subject) {
-  const metadata = {};
-  for (const [key, value] of Object.entries(subject)) {
-    if (key === 'profile' || value == null || typeof value === 'object') continue;
-    metadata[key] = String(value).slice(0, 160);
-  }
-  const profile = profileToText(subject.profile);
-  return {
-    code: String(subject.code || ''),
-    profile_length: profile.length,
-    field_count: Object.keys(subject).length,
-    metadata,
-  };
-}
-
 async function getSubjectDetails(code) {
   assertSignedIn();
   const subjects = subjectCache.length ? subjectCache : await getAllSubjects();
   const subject = subjects.find((item) => String(item.code || '') === String(code));
   if (!subject) throw new Error('Subject was not found. Refresh the HERTA subject list and try again.');
-  const profile = profileToText(subject.profile);
-  let profileJson = null;
-  try { profileJson = profile ? JSON.parse(profile) : null; } catch { /* Non-JSON profile content remains available as text. */ }
-  const fields = Object.fromEntries(Object.entries(subject).filter(([key]) => key !== 'profile'));
-  let profileText = profile;
-  let profileTruncated = false;
-  if (profileText.length > 512 * 1024) {
-    profileText = profileText.slice(0, 512 * 1024);
-    profileTruncated = true;
-  }
-  return { code: String(subject.code || ''), fields, profileText, profileJson, profileLength: profile.length, profileTruncated };
+  return makeSubjectDetails(subject);
 }
 
 async function profileCheck() {
@@ -507,9 +477,16 @@ async function startRestReceiver({ port = 8006 } = {}) {
     const givenToken = String(request.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const supplied = Buffer.from(givenToken); const expected = Buffer.from(token);
     if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) { response.writeHead(401); response.end(JSON.stringify({ error: 'Invalid bearer token.' })); return; }
-    const chunks = []; let bytes = 0;
-    request.on('data', (chunk) => { bytes += chunk.length; if (bytes > MAX_BATCH_BYTES + 2 * 1024 * 1024) request.destroy(new Error('Request body is too large.')); else chunks.push(chunk); });
+    const chunks = []; let bytes = 0; let tooLarge = false;
+    request.on('data', (chunk) => {
+      if (tooLarge) return;
+      bytes += chunk.length;
+      if (bytes > Math.ceil(MAX_BATCH_BYTES * 4 / 3) + 2 * 1024 * 1024) {
+        tooLarge = true; response.writeHead(413); response.end(JSON.stringify({ error: 'Request body is too large.' })); request.resume();
+      } else chunks.push(chunk);
+    });
     request.on('end', () => {
+      if (tooLarge) return;
       try {
         const contentType = String(request.headers['content-type'] || '');
         let files;
@@ -680,17 +657,24 @@ function registerIpc() {
     if (hertaSession) void recordActivity('Signed out', 'The HERTA desktop session ended.');
     hertaSession = null; selectedFiles.clear(); void pauseKafkaSource(); return { ok: true };
   });
-  handle('herta:subjects', async ({ query = '' } = {}) => {
+  handle('herta:subjects', async ({ query = '', group = '', offset = 0, limit = 40 } = {}) => {
     const subjects = await getAllSubjects();
     const normalized = String(query).trim().toLocaleLowerCase();
-    const filtered = normalized ? subjects.filter((item) => {
+    const normalizedGroup = String(group || '');
+    const matching = subjects.filter((item) => {
       const searchable = Object.entries(item).filter(([key, value]) => key !== 'profile' && value != null && typeof value !== 'object').map(([, value]) => String(value)).join(' ');
-      return searchable.toLocaleLowerCase().includes(normalized);
-    }) : subjects;
+      const groupValue = subjectGroup(item);
+      const groupMatches = !normalizedGroup || (normalizedGroup === '__unassigned__' ? !groupValue : groupValue === normalizedGroup);
+      return groupMatches && (!normalized || searchable.toLocaleLowerCase().includes(normalized));
+    });
+    const start = Math.max(0, Number(offset) || 0);
+    const pageSize = Math.max(1, Math.min(100, Number(limit) || 40));
+    const groups = [...new Set(subjects.map(subjectGroup).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     return {
-      subjects: filtered.map(summarizeSubject),
-      count: filtered.length,
+      subjects: matching.slice(start, start + pageSize).map((subject) => ({ ...summarizeSubject(subject), imageDataUrl: extractSubjectImage(subject, 48 * 1024) })),
+      count: matching.length,
       server_count: subjects.length,
+      groups,
     };
   });
   handle('herta:subject-detail', getSubjectDetails);

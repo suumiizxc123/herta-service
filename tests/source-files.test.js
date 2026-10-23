@@ -11,7 +11,7 @@ test('normalizes a REST JSON file envelope into safe NIST filenames', () => {
   assert.deepEqual([...files[0].data], [1, 2, 3]);
 });
 
-test('rejects malformed or oversized source payloads', () => {
+test('rejects malformed or empty source payloads', () => {
   assert.throws(() => normalizeNistSourcePayload({ fileContent: 'not base64!' }), /valid Base64/);
   assert.throws(() => normalizeNistSourcePayload({ files: [] }), /1 to 500/);
 });
