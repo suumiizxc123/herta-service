@@ -1,4 +1,4 @@
-# HERTA Operations Desktop 1.9.24
+# HERTA Operations Desktop 1.9.25
 
 Монгол хэрэглэгчийн гарын авлага: [Markdown](docs/HERTA_Operations_1.9.22_Guide_MN.md).
 

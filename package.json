@@ -1,6 +1,6 @@
 {
   "name": "herta-operations-desktop",
-  "version": "1.9.24",
+  "version": "1.9.25",
   "description": "Desktop interface for HERTA BioCom subject and NIST file operations",
   "private": true,
   "main": "electron/main.js",

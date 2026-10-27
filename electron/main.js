@@ -300,6 +300,37 @@ async function getAllSubjects() {
   return subjects;
 }
 
+function subjectDisplayName(subject) {
+  if (!subject || typeof subject !== 'object') return '';
+  const fields = new Map(Object.entries(subject).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
+  const pick = (keys) => {
+    for (const key of keys) {
+      const value = fields.get(key);
+      if (typeof value === 'string' || typeof value === 'number') {
+        const text = String(value).trim();
+        if (text) return text;
+      }
+    }
+    return '';
+  };
+  const given = pick(['firstname', 'givenname', 'given', 'name']);
+  const family = pick(['lastname', 'surname', 'familyname']);
+  return [given, family].filter(Boolean).join(' ') || pick(['fullname', 'displayname', 'personname']);
+}
+
+async function annotateSubjectFiles(files) {
+  let subjects = subjectCache;
+  if (hertaSession?.token) {
+    try { subjects = await getAllSubjects(); } catch { /* File selection must still work if HERTA is temporarily offline. */ }
+  }
+  const byCode = new Map(subjects.map((subject) => [String(subject.code || '').trim().toLocaleLowerCase(), subject]));
+  return files.map((file) => {
+    const code = path.parse(file.name).name || file.name;
+    const subject = byCode.get(String(code).trim().toLocaleLowerCase());
+    return { ...file, subjectCode: subject ? String(subject.code || code) : code, subjectName: subjectDisplayName(subject) };
+  });
+}
+
 async function getSubjectDetails(code) {
   assertSignedIn();
   const subjects = subjectCache.length ? subjectCache : await getAllSubjects();
@@ -971,7 +1002,7 @@ function registerIpc() {
       output.push({ id: fileId, name: item.name, size: data.length, source: item.source, sourceType: item.sourceType, connectorId: item.connectorId, lastModified: 0 });
     }
     if (!output.length) throw new Error('No valid worker inbox files were selected.');
-    return output;
+    return annotateSubjectFiles(output);
   });
   handle('source:inbox-discard', (id) => DockerPlatform.workerRequest(app, `/api/inbox/${encodeURIComponent(id)}`, { method: 'DELETE' }));
   handle('source:rest-receiver-start', (config = {}) => DockerPlatform.workerRequest(app, '/api/receiver/start', { method: 'POST', body: config }));
@@ -987,13 +1018,14 @@ function registerIpc() {
     });
     if (result.canceled) return [];
     selectedFiles.clear();
-    return Promise.all(result.filePaths.slice(0, MAX_FILE_COUNT).map(async (filePath, index) => {
+    const files = await Promise.all(result.filePaths.slice(0, MAX_FILE_COUNT).map(async (filePath, index) => {
       const stat = await fs.stat(filePath);
       const id = `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
       const file = { id, path: filePath, name: path.basename(filePath) };
       selectedFiles.set(id, file);
       return { id, name: file.name, size: stat.size, lastModified: stat.mtimeMs };
     }));
+    return annotateSubjectFiles(files);
   });
   handle('files:pick-backup', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -1011,7 +1043,7 @@ function registerIpc() {
     selectedFiles.clear();
     const unzipped = unzipSync(archive);
     let total = 0;
-    return nistNames.map(([name, entry], index) => {
+    const files = nistNames.map(([name, entry], index) => {
       const bytes = unzipped[name];
       if (!bytes || bytes.length !== entry.uncompressedSize) throw new Error(`Backup entry ${name} is damaged.`);
       if (bytes.length > MAX_FILE_BYTES || total + bytes.length > MAX_BATCH_BYTES) {
@@ -1022,6 +1054,7 @@ function registerIpc() {
       selectedFiles.set(id, { id, name, data: Buffer.from(bytes) });
       return { id, name, size: bytes.length, lastModified: 0 };
     });
+    return annotateSubjectFiles(files);
   });
   handle('herta:import-preview', async ({ ids, group = '0' }) => {
     const { accepted, rows } = await prepareImport(ids);
