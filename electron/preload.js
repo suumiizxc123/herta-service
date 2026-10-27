@@ -6,8 +6,6 @@ contextBridge.exposeInMainWorld('herta', Object.freeze({
   login: (credentials) => ipcRenderer.invoke('herta:login', credentials),
   logout: () => ipcRenderer.invoke('herta:logout'),
   platformStatus: () => ipcRenderer.invoke('platform:status'),
-  getLicenseConfig: () => ipcRenderer.invoke('platform:license-config'),
-  saveLicenseConfig: (settings) => ipcRenderer.invoke('platform:license-config-save', settings),
   startPlatform: (options) => ipcRenderer.invoke('platform:start', options),
   stopPlatform: () => ipcRenderer.invoke('platform:stop'),
   platformLogs: (service) => ipcRenderer.invoke('platform:logs', service),

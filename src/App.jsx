@@ -119,9 +119,6 @@ export default function App() {
   const [platformError, setPlatformError] = useState('');
   const [platformOptions, setPlatformOptions] = useState({ localKafka: false, search: false });
   const [platformLogText, setPlatformLogText] = useState('');
-  const [licenseConfig, setLicenseConfig] = useState({ url: '', configured: false });
-  const [licenseKey, setLicenseKey] = useState('');
-  const [licenseSaving, setLicenseSaving] = useState(false);
 
   const invoke = useCallback(async (method, ...args) => {
     try { return await window.herta[method](...args); }
@@ -155,11 +152,9 @@ export default function App() {
       try {
         const initialConfig = await invoke('getConfig');
         const currentSession = await invoke('getSession');
-        const installedLicense = await invoke('getLicenseConfig');
         if (!mounted) return;
         setConfig({ ...initialConfig, verifyTls: false });
         setSession(currentSession);
-        setLicenseConfig(installedLicense);
         const connectors = await invoke('getConnectorSettings');
         if (!mounted) return;
         setRestSource(connectors.rest);
@@ -411,21 +406,6 @@ export default function App() {
     finally { setPlatformLoading(false); }
   };
 
-  const saveLicense = async () => {
-    setLicenseSaving(true); setPlatformError('');
-    try {
-      const result = await invoke('saveLicenseConfig', { url: licenseConfig.url, key: licenseKey });
-      setLicenseConfig({ url: result.url, configured: result.configured });
-      setLicenseKey('');
-      if (result.status) setPlatform(result.status);
-      await refreshPlatform();
-      if (result.status?.worker?.license?.valid) notify(`License active until ${new Date(result.status.worker.license.expiresAt).toLocaleString()}.`);
-      else if (result.status?.worker?.license?.reason) notify(`License saved, but validation is ${result.status.worker.license.reason}.`, true);
-      else notify(result.configured ? 'License saved. Start the Docker worker to validate it.' : 'License settings cleared. Licensed operations are locked.', !result.configured);
-    } catch (error) { setPlatformError(error.message); }
-    finally { setLicenseSaving(false); }
-  };
-
   useEffect(() => {
     if (view === 'health' || view === 'overview') refreshHealth();
     if (view === 'activity' || view === 'backups') refreshAudit();
@@ -440,11 +420,6 @@ export default function App() {
     const timer = window.setInterval(() => { if (view === 'intake') refreshInbox(); else refreshPlatform(); }, view === 'backups' ? 15000 : 5000);
     return () => window.clearInterval(timer);
   }, [view, refreshInbox, refreshPlatform]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => { void invoke('platformStatus').then(setPlatform).catch(() => {}); }, 60_000);
-    return () => window.clearInterval(timer);
-  }, [invoke]);
 
   useEffect(() => {
     if (view === 'queue-history') { const timer = window.setInterval(refreshQueueHistory, 10000); return () => window.clearInterval(timer); }
@@ -703,7 +678,7 @@ export default function App() {
     waitingInbox: sourceInbox.filter((item) => !item.error).length,
   }), [sourceInbox]);
 
-  if (!session.authenticated) return <Login config={config} setConfig={setConfig} notice={notice} loading={loading} onSubmit={connect} licenseConfig={licenseConfig} setLicenseConfig={setLicenseConfig} licenseKey={licenseKey} setLicenseKey={setLicenseKey} licenseSaving={licenseSaving} onSaveLicense={saveLicense} licenseStatus={platform.worker?.license} licenseError={platformError} />;
+  if (!session.authenticated) return <Login config={config} setConfig={setConfig} notice={notice} loading={loading} onSubmit={connect} />;
 
   return <div className="flex min-h-screen bg-background text-foreground">
     <aside className="sidebar flex w-[248px] shrink-0 flex-col border-r border-slate-200 px-4 py-5">
@@ -722,7 +697,7 @@ export default function App() {
           <p className="mt-2 truncate text-[11px] text-slate-500" title={session.baseUrl}>{session.baseUrl}</p>
         </div>
         <Button variant="ghost" className="mt-3 w-full justify-start text-slate-600 hover:bg-slate-100 hover:text-slate-900" onClick={signOut}><LogOut /> Sign out</Button>
-        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.9.23'}</div>
+        <div className="mt-3 px-3 text-[10px] text-slate-500">Desktop client · v{config.version || '1.9.22'}</div>
       </div>
     </aside>
 
@@ -731,7 +706,6 @@ export default function App() {
         <div className="text-xs text-muted-foreground">HERTA <span className="mx-2 text-slate-300">/</span><span className="font-medium text-foreground">{titleFor[view]}</span></div>
         <div className="window-no-drag flex items-center gap-3">{headerAction}<div className="ml-1 flex size-8 items-center justify-center rounded-full bg-[#eaf0f5] text-xs font-semibold text-[#315273]">OP</div></div>
       </header>
-      {licenseConfig.configured && platform.worker?.license?.valid === false && <div role="alert" className="mx-8 mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950"><span>License expired or could not be checked. HERTA operations and background connectors are paused.</span><Button size="sm" variant="outline" onClick={() => setView('overview')}>Open license settings</Button></div>}
 
       <div key={view} className="page-transition mx-auto max-w-[1320px] px-8 pb-28 pt-8">
         {view === 'overview' && <>
@@ -762,8 +736,6 @@ export default function App() {
             <div className="space-y-3"><div className="flex flex-wrap items-center gap-2 text-xs"><span className={`size-2 rounded-full ${platform.worker?.ok ? 'bg-emerald-500' : 'bg-slate-300'}`} /><span className="font-medium text-slate-800">HERTA integration & backup worker</span><Badge variant="secondary" className={platform.worker?.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}>{platform.worker?.ok ? 'Running' : 'Stopped'}</Badge>{platform.worker?.authenticated && <Badge variant="outline" className="text-emerald-700">HERTA session synced</Badge>}</div><div className="grid gap-2 sm:grid-cols-2">{(platform.services || []).map((service) => <div key={service.ID || service.Name || service.Service} className="flex items-center justify-between rounded-lg border px-3 py-2 text-[11px]"><span className="font-medium text-slate-700">{service.Service}</span><span className="text-slate-500">{service.Health || service.State || service.Status}</span></div>)}{!platform.services?.length && <div className="rounded-lg border border-dashed px-3 py-2 text-[11px] text-slate-500 sm:col-span-2">{platform.engine?.available ? 'No Docker workers are running yet.' : (platform.engine?.error || platformError || 'Install Docker Desktop and start its engine to run background workers.')}</div>}</div>{platformError && <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-800">{platformError}</div>}{platform.worker?.error && <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">{platform.worker.error}</div>}{platformLogText && <pre className="max-h-32 overflow-auto rounded-lg bg-slate-950 p-3 text-[10px] leading-4 text-slate-100">{platformLogText}</pre>}</div>
             <div className="flex min-w-[220px] flex-col justify-center gap-3 rounded-xl border bg-slate-50/70 p-4"><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Optional local services</div><label className="flex items-center gap-2 text-xs text-slate-700"><Checkbox checked={platformOptions.localKafka} onCheckedChange={(checked) => setPlatformOptions((current) => ({ ...current, localKafka: Boolean(checked) }))} />Start a local Kafka broker</label><label className="flex items-center gap-2 text-xs text-slate-700"><Checkbox checked={platformOptions.search} onCheckedChange={(checked) => setPlatformOptions((current) => ({ ...current, search: Boolean(checked) }))} />Start Elasticsearch</label><div className="flex gap-2"><Button variant="outline" size="sm" className="flex-1" onClick={refreshPlatform}><RefreshCw /> Status</Button><Button variant="ghost" size="sm" onClick={async () => { try { setPlatformLogText(await invoke('platformLogs', 'herta-worker')); } catch (error) { setPlatformError(error.message); } }}>Logs</Button></div><div className="text-[10px] leading-4 text-slate-500">Worker data and scheduled ZIP snapshots persist in Docker volumes / the selected backup folder.</div></div>
           </CardContent></Card>
-
-          <Card className="mt-5 border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><CardTitle className="text-base">System license</CardTitle><CardDescription className="mt-1">The worker checks Render every minute and pauses operations when the license expires.</CardDescription></div><Badge variant="outline" className={platform.worker?.license?.valid ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-800'}>{platform.worker?.license?.valid ? 'Active' : platform.worker?.license?.reason === 'expired' ? 'Expired' : licenseConfig.configured ? 'Checking' : 'Not configured'}</Badge></div></CardHeader><CardContent className="grid gap-4 p-5 lg:grid-cols-[1fr_1fr_auto]"><div><label className="mb-1.5 block text-xs font-medium">Render license service URL</label><Input value={licenseConfig.url} onChange={(event) => setLicenseConfig((current) => ({ ...current, url: event.target.value }))} placeholder="https://herta-license-service.onrender.com" autoComplete="url" /><p className="mt-1.5 text-[11px] text-slate-500">Use the HTTPS URL shown in Render.</p></div><div><label className="mb-1.5 block text-xs font-medium">License key</label><Input type="password" autoComplete="new-password" value={licenseKey} onChange={(event) => setLicenseKey(event.target.value)} placeholder={licenseConfig.configured ? 'Saved · leave blank to keep it' : 'Paste the issued HERTA license key'} /><p className="mt-1.5 text-[11px] text-slate-500">Key is stored in local Docker settings and sent to Render over HTTPS.</p></div><div className="flex flex-col justify-end gap-2"><Button onClick={saveLicense} disabled={licenseSaving || (!licenseKey && !licenseConfig.configured)}>{licenseSaving ? <LoaderCircle className="animate-spin" /> : <ShieldCheck />}{platform.worker?.ok ? 'Save and restart worker' : 'Save license'}</Button>{licenseConfig.configured && platform.worker?.license?.expiresAt && <span className="text-[10px] text-slate-500">Expires {new Date(platform.worker.license.expiresAt).toLocaleString()}</span>}</div>{platform.worker?.license?.lastError && <div role="alert" className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900 lg:col-span-3">License service check: {platform.worker.license.lastError}</div>}</CardContent></Card>
 
           <Card className="mt-5 border-slate-200/80 shadow-sm"><CardHeader className="border-b bg-white px-5 py-4"><CardTitle className="text-base">Quick actions</CardTitle><CardDescription className="mt-1">Open the task you need.</CardDescription></CardHeader><CardContent className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-4"><ActionTile icon={Users} title="Browse subjects" description={`${serverCount.toLocaleString()} HERTA records`} onClick={() => setView('subjects')} /><ActionTile icon={ArrowDownToLine} title="Export NIST" description="Select records and save files" onClick={() => setView('export')} /><ActionTile icon={Upload} title="Import NIST" description={`${files.length} file(s) in the queue`} onClick={() => setView('import')} /><ActionTile icon={Cloud} title="Received inbox" description={`${sourceInbox.length} file(s) from worker connectors`} onClick={() => setView('intake')} /></CardContent></Card>
 
@@ -968,12 +940,12 @@ export default function App() {
   </div>;
 }
 
-function Login({ config, setConfig, notice, loading, onSubmit, licenseConfig, setLicenseConfig, licenseKey, setLicenseKey, licenseSaving, onSaveLicense, licenseStatus, licenseError }) {
+function Login({ config, setConfig, notice, loading, onSubmit }) {
   return <div className="flex min-h-screen items-stretch bg-white">
     <section className="hidden w-[48%] flex-col justify-between border-r border-slate-200 bg-[#f3f6f9] px-12 py-10 text-slate-800 lg:flex">
       <div className="flex items-center gap-3"><div className="flex size-10 items-center justify-center rounded-xl bg-white text-[#315a80] shadow-sm"><Fingerprint className="size-6" /></div><div><div className="font-semibold tracking-wide">HERTA</div><div className="text-[11px] text-slate-500">Operations desktop</div></div></div>
       <div className="max-w-[500px] pb-6"><div className="mb-6 flex size-12 items-center justify-center rounded-2xl border border-slate-200 bg-white"><Database className="size-6 text-[#53799f]" /></div><div className="text-[34px] font-semibold leading-[1.17] tracking-tight">Biometric operations, <span className="text-[#53799f]">thoughtfully connected.</span></div><p className="mt-5 max-w-[420px] text-sm leading-6 text-slate-600">A secure desktop workspace for HERTA subject records, NIST file operations, and profile metadata checks.</p><div className="mt-9 grid grid-cols-3 gap-3"><Feature icon={Users} label="Subjects" /><Feature icon={FileArchive} label="NIST files" /><Feature icon={ShieldCheck} label="Local session" /></div></div>
-      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.9.23'}</div>
+      <div className="text-xs text-slate-500">HERTA Operations · v{config.version || '1.9.22'}</div>
     </section>
     <section className="flex flex-1 items-center justify-center px-6 py-10">
       <div className="w-full max-w-[410px]">
@@ -988,11 +960,6 @@ function Login({ config, setConfig, notice, loading, onSubmit, licenseConfig, se
           <Button type="submit" className="h-10 w-full" disabled={loading}>{loading ? <><LoaderCircle className="animate-spin" /> Connecting...</> : <>Sign in <ArrowRight /></>}</Button>
         </form>
         <div className="mt-6 flex items-start gap-2.5 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-[#53799f]" /><span>Your HERTA credentials are encrypted for automatic hourly sign-in. The Docker worker renews access in the background; signing out clears saved credentials from the app and worker.</span></div>
-        <details className="mt-7 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
-          <summary className="cursor-pointer text-sm font-medium text-slate-800">System license activation</summary>
-          <p className="mt-2 text-xs leading-5 text-slate-500">Enter the Render license service URL and issued key. The worker checks the license every minute.</p>
-          <div className="mt-4 space-y-3"><div><label className="mb-1.5 block text-xs font-medium">Render service URL</label><Input type="url" value={licenseConfig.url} onChange={event => setLicenseConfig(current => ({ ...current, url: event.target.value }))} placeholder="https://herta-license-service.onrender.com" /></div><div><label className="mb-1.5 block text-xs font-medium">License key</label><Input type="password" autoComplete="new-password" value={licenseKey} onChange={event => setLicenseKey(event.target.value)} placeholder={licenseConfig.configured ? 'Saved · leave blank to keep it' : 'Paste issued license key'} /></div><Button type="button" variant="outline" className="w-full" onClick={onSaveLicense} disabled={licenseSaving || (!licenseKey && !licenseConfig.configured)}>{licenseSaving ? <LoaderCircle className="animate-spin" /> : <ShieldCheck />}{licenseConfig.configured ? 'Save license and restart worker' : 'Save license and start worker'}</Button>{licenseStatus && <p className="text-xs text-slate-600">{licenseStatus.valid ? `Active until ${new Date(licenseStatus.expiresAt).toLocaleString()}` : `License: ${licenseStatus.reason || 'waiting for a worker check'}`}</p>}{licenseError && <p role="alert" className="rounded-lg bg-rose-50 p-2.5 text-xs text-rose-800">{licenseError}</p>}</div>
-        </details>
       </div>
     </section>
   </div>;

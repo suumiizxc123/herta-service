@@ -55,8 +55,8 @@ async function environmentFile(app) {
   if (!values.HERTA_BACKUP_PATH) values.HERTA_BACKUP_PATH = path.join(folder, 'backups').replace(/\\/g, '/');
   await fs.mkdir(values.HERTA_BACKUP_PATH, { recursive: true });
   const escape = (value) => `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`;
-  await fs.writeFile(file, `HERTA_WORKER_API_TOKEN=${escape(values.HERTA_WORKER_API_TOKEN)}\nHERTA_BACKUP_PATH=${escape(values.HERTA_BACKUP_PATH)}\nHERTA_LICENSE_URL=${escape(values.HERTA_LICENSE_URL || '')}\nHERTA_LICENSE_KEY=${escape(values.HERTA_LICENSE_KEY || '')}\n`, { mode: 0o600 });
-  return { file, token: values.HERTA_WORKER_API_TOKEN, backupPath: values.HERTA_BACKUP_PATH, licenseUrl: values.HERTA_LICENSE_URL || '', licenseKey: values.HERTA_LICENSE_KEY || '', licenseConfigured: Boolean(values.HERTA_LICENSE_URL && values.HERTA_LICENSE_KEY) };
+  await fs.writeFile(file, `HERTA_WORKER_API_TOKEN=${escape(values.HERTA_WORKER_API_TOKEN)}\nHERTA_BACKUP_PATH=${escape(values.HERTA_BACKUP_PATH)}\n`, { mode: 0o600 });
+  return { file, token: values.HERTA_WORKER_API_TOKEN, backupPath: values.HERTA_BACKUP_PATH };
 }
 
 function composeArgs(app, envFile, args) {
@@ -100,12 +100,7 @@ async function platformStatus(app) {
   if (services.some((service) => service.Service === 'herta-worker' && /up|running/i.test(service.State || service.Status || ''))) {
     try { worker = await workerRequest(app, '/api/status'); } catch (error) { worker = { ok: false, error: error.message }; }
   }
-  return { engine, services, worker, backupPath: env.backupPath, licenseUrl: env.licenseUrl, licenseConfigured: env.licenseConfigured };
-}
-
-async function getLicenseConfig(app) {
-  const env = await environmentFile(app);
-  return { url: env.licenseUrl, configured: env.licenseConfigured };
+  return { engine, services, worker, backupPath: env.backupPath };
 }
 
 async function startPlatform(app, options = {}) {
@@ -132,8 +127,7 @@ async function configureBackupMount(app, directory) {
   const env = await environmentFile(app);
   const folder = path.resolve(String(directory || env.backupPath));
   await fs.mkdir(folder, { recursive: true });
-  const escape = (value) => `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`;
-  const next = `HERTA_WORKER_API_TOKEN=${escape(env.token)}\nHERTA_BACKUP_PATH=${escape(folder.replace(/\\/g, '/'))}\nHERTA_LICENSE_URL=${escape(env.licenseUrl)}\nHERTA_LICENSE_KEY=${escape(env.licenseKey)}\n`;
+  const next = `HERTA_WORKER_API_TOKEN="${env.token}"\nHERTA_BACKUP_PATH="${folder.replace(/\\/g, '/')}"\n`;
   await fs.writeFile(env.file, next, { mode: 0o600 });
   return folder;
 }
@@ -142,33 +136,6 @@ async function recreateWorker(app) {
   const env = await environmentFile(app);
   await run('docker', composeArgs(app, env.file, ['up', '-d', '--build', '--force-recreate', 'herta-worker']), { cwd: composeDirectory(app), timeout: 15 * 60 * 1000 });
   return platformStatus(app);
-}
-
-async function configureLicense(app, settings = {}) {
-  const env = await environmentFile(app);
-  const urlValue = String(settings.url || '').trim().replace(/\/+$/, '');
-  const keyValue = String(settings.key || '').trim();
-  if (!urlValue && !keyValue) {
-    env.licenseUrl = '';
-    env.licenseKey = '';
-  } else {
-    let url;
-    try { url = new URL(urlValue); } catch { throw new Error('Enter the HTTPS URL of your license service.'); }
-    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new Error('License service URL must use HTTPS and must not include credentials, query, or fragment.');
-    if (keyValue) {
-      if (!/^herta_[A-Za-z0-9_-]{40,}$/.test(keyValue)) throw new Error('License key format is not valid.');
-      env.licenseKey = keyValue;
-    } else if (!env.licenseKey) throw new Error('Paste the license key issued by your Render license service.');
-    env.licenseUrl = url.toString().replace(/\/+$/, '');
-  }
-  const escape = (value) => `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`;
-  await fs.writeFile(env.file, `HERTA_WORKER_API_TOKEN=${escape(env.token)}\nHERTA_BACKUP_PATH=${escape(env.backupPath.replace(/\\/g, '/'))}\nHERTA_LICENSE_URL=${escape(env.licenseUrl)}\nHERTA_LICENSE_KEY=${escape(env.licenseKey)}\n`, { mode: 0o600 });
-  const status = await platformStatus(app);
-  if (status.engine.available) {
-    const isRunning = (name) => status.services.some(service => service.Service === name && /up|running/i.test(service.State || service.Status || ''));
-    await startPlatform(app, { localKafka: isRunning('kafka'), search: isRunning('elasticsearch') });
-  }
-  return { url: env.licenseUrl, configured: Boolean(env.licenseUrl && env.licenseKey), status: await platformStatus(app) };
 }
 
 async function stopPlatform(app) {
@@ -202,4 +169,4 @@ async function setWorkerSession(app, value) {
   } catch { return false; } finally { clearTimeout(timer); }
 }
 
-module.exports = { platformStatus, getLicenseConfig, startPlatform, stopPlatform, platformLogs, workerRequest, setWorkerSession, configureBackupMount, configureLicense, recreateWorker };
+module.exports = { platformStatus, startPlatform, stopPlatform, platformLogs, workerRequest, setWorkerSession, configureBackupMount, recreateWorker };

@@ -1,6 +1,4 @@
-# HERTA Operations Desktop 1.9.23
-
-Next desktop build: **1.9.23** adds Render license validation to the Docker worker. Use the root [Render Blueprint](render.yaml) to deploy the standalone issuer. Setup and license-key commands: [License service guide](platform/license-service/README.md).
+# HERTA Operations Desktop 1.9.24
 
 Монгол хэрэглэгчийн гарын авлага: [Markdown](docs/HERTA_Operations_1.9.22_Guide_MN.md).
 
@@ -9,10 +7,6 @@ Connectors has exactly two types: **REST connector** and **Kafka connector**, wi
 The Import workspace includes Files, REST API and Kafka sources. Manage saved source connections, fetch REST data, select received items and preview or import a batch on one screen. Run **Dashboard → Apply / start** after updating the desktop app to build the worker with connector-specific queue metadata and duplicate checks for manual REST fetches.
 
 Electron is the control interface. A Docker Compose worker handles REST intake, Kafka consumption, the persistent review inbox, and scheduled NIST ZIP backups independently of the Electron window. Windows requires Docker Desktop with its engine running; install/start Docker Desktop before using **Start workers** on the Dashboard page.
-
-## License service
-
-The standalone Render license issuer, persistent registry, license creation/revocation API, deployment Blueprint and setup guide are in [platform/license-service](platform/license-service/README.md). Connect the Render URL and issued key under **Dashboard → System license**. The Docker worker checks the license once a minute and pauses licensed operations when it expires or when the last successful 75-second lease lapses. See the Render setup and one-time key issuance commands in that guide.
 
 ## Background platform
 
